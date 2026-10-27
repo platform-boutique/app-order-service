@@ -38,6 +38,8 @@ const (
 	// MaxUnits bounds one money amount (a unit price or shipping cost), so that
 	// 100 lines x 1000 pieces can never overflow an int64.
 	MaxUnits = 1_000_000_000
+	// MaxTotalUnits bounds the order total (100 x 1000 x MaxUnits plus shipping fits below it).
+	MaxTotalUnits = 200_000_000_000_000
 
 	nanosPerUnit = 1_000_000_000
 )
@@ -128,9 +130,9 @@ func ValidateOrderID(id string) (string, error) {
 	return id, nil
 }
 
-// ValidateMoney checks one amount: 3 upper-case letters currency, 0 <= units <= MaxUnits,
+// ValidateMoney checks one amount: 3 upper-case letters currency, 0 <= units <= maxUnits,
 // 0 <= nanos < 1e9. A zero amount is only accepted when allowZero.
-func ValidateMoney(field string, m *pb.Money, allowZero bool) (Money, error) {
+func ValidateMoney(field string, m *pb.Money, maxUnits int64, allowZero bool) (Money, error) {
 	if m == nil {
 		return Money{}, invalid("%s is required", field)
 	}
@@ -138,8 +140,8 @@ func ValidateMoney(field string, m *pb.Money, allowZero bool) (Money, error) {
 	if len(cur) != 3 || strings.Trim(cur, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
 		return Money{}, invalid("%s.currency_code must be three upper-case letters", field)
 	}
-	if m.GetUnits() < 0 || m.GetUnits() > MaxUnits {
-		return Money{}, invalid("%s.units must be 0-%d, got %d", field, int64(MaxUnits), m.GetUnits())
+	if m.GetUnits() < 0 || m.GetUnits() > maxUnits {
+		return Money{}, invalid("%s.units must be 0-%d, got %d", field, maxUnits, m.GetUnits())
 	}
 	if m.GetNanos() < 0 || m.GetNanos() >= nanosPerUnit {
 		return Money{}, invalid("%s.nanos must be 0-999999999, got %d", field, m.GetNanos())
@@ -199,14 +201,14 @@ func ValidateNewOrder(req *pb.CreateOrderRequest) (NewOrder, error) {
 	}
 	cur := n.Items[0].UnitPrice.Currency
 
-	total, err := ValidateMoney("total", req.GetTotal(), false)
+	total, err := ValidateMoney("total", req.GetTotal(), MaxTotalUnits, false)
 	if err != nil {
 		return NewOrder{}, err
 	}
 	n.Total = total
 	if req.GetShippingCost() == nil {
 		n.ShippingCost = Money{Currency: total.Currency}
-	} else if n.ShippingCost, err = ValidateMoney("shipping_cost", req.GetShippingCost(), true); err != nil {
+	} else if n.ShippingCost, err = ValidateMoney("shipping_cost", req.GetShippingCost(), MaxUnits, true); err != nil {
 		return NewOrder{}, err
 	}
 	for i, it := range n.Items {
@@ -277,7 +279,7 @@ func validateItem(i int, it *pb.OrderItem) (Item, error) {
 		return Item{}, invalid("%s must be 1-%d, got %d", f("quantity"), MaxQuantity, q)
 	}
 	out.Quantity = it.GetQuantity()
-	if out.UnitPrice, err = ValidateMoney(f("unit_price"), it.GetUnitPrice(), false); err != nil {
+	if out.UnitPrice, err = ValidateMoney(f("unit_price"), it.GetUnitPrice(), MaxUnits, false); err != nil {
 		return Item{}, err
 	}
 	if out.Picture, err = text(f("picture"), it.GetPicture(), 0, MaxPictureLen); err != nil {

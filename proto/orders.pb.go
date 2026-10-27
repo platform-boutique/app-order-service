@@ -90,7 +90,8 @@ func (OrderStatus) EnumDescriptor() ([]byte, []int) {
 }
 
 // Same fields as hipstershop.Money. In this service: currency_code is three upper-case
-// letters, units >= 0 (at most 1,000,000,000), nanos 0..999,999,999 (no negative amounts).
+// letters, units >= 0 (unit_price and shipping_cost: at most 1,000,000,000; total: at most 200,000,000,000,000),
+// nanos 0..999,999,999. No negative amounts; unit_price and total must be > 0.
 type Money struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CurrencyCode  string                 `protobuf:"bytes,1,opt,name=currency_code,json=currencyCode,proto3" json:"currency_code,omitempty"`
