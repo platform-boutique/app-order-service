@@ -98,6 +98,14 @@ Multi-stage [`Dockerfile`](Dockerfile) (same as review-service): `golang:1.26-al
 - **HEALTHCHECK:** `/app/order-service healthcheck` calls the gRPC health service on `127.0.0.1:$PORT` and exits 0 only on `SERVING`.
 - **EXPOSE:** `8085`, `9090`. Built once locally on amd64 (`docker build -t platform-demo/order-service:local .`, about 12 MB); arm64 was not built.
 
+## Used by (local shop)
+
+- **checkout-service** (branch `feat/orders-integration`, env `ORDER_SERVICE_ADDR=order-service:8085`) calls `CreateOrder` before it charges the card, `ConfirmOrder` after shipping and `FailOrder` on any error. With the variable unset checkout does not store orders.
+- **frontend** (env `ORDER_SERVICE_ADDR`, default `order-service:8085`) calls `ListOrders` (`session_id`, `placed_only`) for `/orders` and `GetOrder` (with the session as guard) for `/orders/{id}`, and draws the tracker from the status and the stage timestamps compared with `evaluated_at`.
+- Orders are keyed by the browser session today. Accounts (a user service) are the next slice: `user_id` is already stored and `ListOrders` accepts it, but nothing sets it yet and anonymous orders are not adopted by a user after login (see the plan).
+
+The local stack (`local/compose.yaml` in the workspace, not in this repository) runs `order-db` (postgres:17-alpine) and `order-service` on port 8085. Run on the live stack: an order placed in the browser is stored as `PLACED` with its tracking id and shows up in the frontend's history and tracking page (first stage seen), declined cards are stored as `FAILED` with the reason. The progression through all four stages is covered by this service's tests (injectable clock) and the frontend's tests with a fake client; the default 1/3/6 minute offsets were not waited through on the live stack.
+
 ## Not deployed anywhere yet
 
 No Helm chart, pipeline, Backstage entry or GitHub repository exists; the service is only built and run locally.
