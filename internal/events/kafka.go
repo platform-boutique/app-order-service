@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -50,7 +51,12 @@ func (s *kgoSource) Poll(ctx context.Context) ([]Record, error) {
 		return nil, ctx.Err()
 	}
 	var errs []error
+	topicMissing := false
 	fetches.EachError(func(topic string, partition int32, err error) {
+		if errors.Is(err, kerr.UnknownTopicOrPartition) || errors.Is(err, kerr.UnknownTopicID) {
+			topicMissing = true
+			return
+		}
 		errs = append(errs, fmt.Errorf("%s/%d: %w", topic, partition, err))
 	})
 	var out []Record
@@ -62,6 +68,9 @@ func (s *kgoSource) Poll(ctx context.Context) ([]Record, error) {
 	})
 	if len(out) == 0 {
 		s.cl.AllowRebalance()
+		if len(errs) == 0 && topicMissing {
+			return nil, ErrTopicNotAvailable
+		}
 		return nil, errors.Join(errs...)
 	}
 	if len(errs) > 0 {

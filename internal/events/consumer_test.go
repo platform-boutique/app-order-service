@@ -512,3 +512,23 @@ func TestConfirmHandlerReturnsTransientErrors(t *testing.T) {
 		t.Errorf("res=%q err=%v", res, err)
 	}
 }
+
+func TestConsumerWaitsForAMissingTopicAtInfoLevelWithoutGrowingBackoff(t *testing.T) {
+	src := newFakeSource([]Record{rec(0, 0, eventJSON("a"))})
+	missing := fmt.Errorf("%w: orders.placed", ErrTopicNotAvailable)
+	src.pollErrs = []error{missing, missing, missing}
+	h := &fakeHandler{}
+	r := newRig(src, h)
+	r.run(t)
+	r.stop(t)
+	d := r.sl.durations()
+	if len(d) != 3 || d[0] != 2*time.Second || d[1] != 2*time.Second || d[2] != 2*time.Second {
+		t.Errorf("waits %v, want 3 x 2s", d)
+	}
+	if strings.Contains(r.logs.String(), "level=warning") || !strings.Contains(r.logs.String(), "waiting for topic") {
+		t.Errorf("a missing topic must be logged at info only: %s", r.logs.String())
+	}
+	if len(h.called()) != 1 {
+		t.Errorf("record after the topic appeared was not handled: %v", h.called())
+	}
+}

@@ -24,6 +24,11 @@ type Record struct {
 // ErrSourceClosed is returned by Poll once the source has been closed.
 var ErrSourceClosed = errors.New("record source closed")
 
+// ErrTopicNotAvailable is returned (wrapped) by Poll while the topic does not exist yet or has no leader yet
+// (UNKNOWN_TOPIC_OR_PARTITION): nobody has published, or the broker is still creating it. Not a failure: the consumer
+// logs it at info and asks again after TopicWait.
+var ErrTopicNotAvailable = errors.New("topic not available yet")
+
 // Source is where records come from and where offsets go back to. The Kafka implementation is NewKafkaSource;
 // tests use a fake.
 type Source interface {
@@ -52,6 +57,8 @@ type Consumer struct {
 	// AttemptTimeout bounds one handling attempt (default 3 s). The attempt is not cancelled by shutdown: a record
 	// that is being handled when SIGTERM arrives is finished and committed.
 	AttemptTimeout time.Duration
+	// TopicWait is the pause before polling again while the topic is not available (default 2 s, not growing).
+	TopicWait time.Duration
 	// CommitTimeout bounds the offset commit, also during shutdown (default 3 s).
 	CommitTimeout time.Duration
 }
@@ -86,6 +93,9 @@ func (c *Consumer) defaults() {
 	if c.AttemptTimeout == 0 {
 		c.AttemptTimeout = 3 * time.Second
 	}
+	if c.TopicWait == 0 {
+		c.TopicWait = 2 * time.Second
+	}
 	if c.CommitTimeout == 0 {
 		c.CommitTimeout = 3 * time.Second
 	}
@@ -101,6 +111,13 @@ func (c *Consumer) Run(ctx context.Context) {
 		recs, err := c.Source.Poll(ctx)
 		if ctx.Err() != nil || errors.Is(err, ErrSourceClosed) {
 			return
+		}
+		if errors.Is(err, ErrTopicNotAvailable) && len(recs) == 0 {
+			c.Log.Infof("waiting for topic: %v", err)
+			if !c.Sleep(ctx, c.TopicWait) {
+				return
+			}
+			continue
 		}
 		if err != nil && len(recs) == 0 {
 			pollFailures++

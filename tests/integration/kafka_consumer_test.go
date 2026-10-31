@@ -7,8 +7,10 @@
 //	  go test -race -count=1 -tags integration -run Kafka ./tests/integration/
 //
 // TEST_KAFKA_CONTAINER (the name of the throwaway broker container) additionally enables the broker-restart test.
-// The broker must auto-create topics. Every test uses its own topic and consumer group, so tests do not see each
-// other's records. The host clock of the development machine jumps, so every wait polls with a 30 s deadline.
+// Every test creates its own topic (3 partitions, created explicitly and waited for until every partition has a
+// leader; no reliance on auto-creation) and uses its own consumer group, so tests do not see each other's records.
+// The host clock of the development machine jumps and a loaded broker is slow, so all waits are generous (60 s;
+// the broker-restart test 180 s) and only matter when something is really wrong.
 package integration
 
 import (
@@ -31,10 +33,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-const kafkaWait = 30 * time.Second
+const kafkaWait = 60 * time.Second
 
 func kafkaBrokers(t *testing.T) string {
 	t.Helper()
@@ -60,10 +64,101 @@ func eventValue(orderID, tracking, txn string) []byte {
 		`"shipping_tracking_id":%[2]q,"payment_transaction_id":%[3]q,"added_later":true}`, orderID, tracking, txn))
 }
 
-// produce publishes records (key, value) to the topic and waits for the acks; it auto-creates the topic.
+// tolerantProducer keeps retrying a topic or leader that is not known yet (a loaded broker needs seconds, kgo's
+// default gives up after about one) and has long timeouts.
+func tolerantProducer(brokers string) (*kgo.Client, error) {
+	return kgo.NewClient(
+		kgo.SeedBrokers(strings.Split(brokers, ",")...),
+		kgo.UnknownTopicRetries(-1),
+		kgo.ProduceRequestTimeout(30*time.Second),
+		kgo.RecordDeliveryTimeout(kafkaWait),
+		kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
+	)
+}
+
+// createTopic creates the topic explicitly (3 partitions) and returns when the metadata shows a leader for every
+// partition. An existing topic is fine.
+func createTopic(t *testing.T, brokers, topic string) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*kafkaWait)
+	defer cancel()
+	var last error
+	for ctx.Err() == nil {
+		last = createTopicOnce(ctx, cl, topic)
+		if last == nil {
+			last = topicHasLeaders(ctx, cl, topic, 3)
+		}
+		if last == nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("topic %s not ready: %v", topic, last)
+}
+
+func createTopicOnce(ctx context.Context, cl *kgo.Client, topic string) error {
+	req := kmsg.NewCreateTopicsRequest()
+	req.TimeoutMillis = 30_000
+	rt := kmsg.NewCreateTopicsRequestTopic()
+	rt.Topic, rt.NumPartitions, rt.ReplicationFactor = topic, 3, 1
+	req.Topics = append(req.Topics, rt)
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return err
+	}
+	for _, rs := range resp.Topics {
+		if err := kerr.ErrorForCode(rs.ErrorCode); err != nil && !errors.Is(err, kerr.TopicAlreadyExists) {
+			return fmt.Errorf("create %s: %w", rs.Topic, err)
+		}
+	}
+	return nil
+}
+
+func topicHasLeaders(ctx context.Context, cl *kgo.Client, topic string, partitions int) error {
+	req := kmsg.NewMetadataRequest()
+	rt := kmsg.NewMetadataRequestTopic()
+	rt.Topic = &topic
+	req.Topics = append(req.Topics, rt)
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return err
+	}
+	for _, mt := range resp.Topics {
+		if err := kerr.ErrorForCode(mt.ErrorCode); err != nil {
+			return err
+		}
+		if len(mt.Partitions) != partitions {
+			return fmt.Errorf("%d partitions, want %d", len(mt.Partitions), partitions)
+		}
+		for _, p := range mt.Partitions {
+			if err := kerr.ErrorForCode(p.ErrorCode); err != nil {
+				return err
+			}
+			if p.Leader < 0 {
+				return fmt.Errorf("partition %d has no leader yet", p.Partition)
+			}
+		}
+	}
+	return nil
+}
+
+// newTopic returns a unique topic that exists and has leaders.
+func newTopic(t *testing.T, brokers string) string {
+	t.Helper()
+	topic := uniq("orders.placed.it")
+	createTopic(t, brokers, topic)
+	return topic
+}
+
+// produce publishes records (key, value) to the (existing) topic and waits for the acks.
 func produce(t *testing.T, brokers, topic string, kv ...[2][]byte) {
 	t.Helper()
-	cl, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...), kgo.AllowAutoTopicCreation(), kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)))
+	cl, err := tolerantProducer(brokers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,10 +242,15 @@ func getOrder(t *testing.T, svc *orders.Service, id string) *pb.Order {
 	return o
 }
 
-// until polls cond every 100 ms for up to 30 s.
+// until polls cond every 100 ms for up to kafkaWait.
 func until(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(kafkaWait)
+	untilWithin(t, kafkaWait, what, cond)
+}
+
+func untilWithin(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -168,11 +268,11 @@ func isPlaced(t *testing.T, svc *orders.Service, id string) func() bool {
 func TestKafkaPendingBecomesPlaced(t *testing.T) {
 	brokers := kafkaBrokers(t)
 	svc, _, _ := setup(t)
-	topic, group := uniq("orders.placed.it"), uniq("g")
+	topic, group := newTopic(t, brokers), uniq("g")
 	id := uniq("ord")
 	createPending(t, svc, id)
 
-	rc := startConsumer(t, brokers, topic, group, svc) // the topic does not exist yet: the consumer waits for it
+	rc := startConsumer(t, brokers, topic, group, svc)
 	time.Sleep(2 * time.Second)
 	if getOrder(t, svc, id).Status != pb.OrderStatus_ORDER_STATUS_PENDING {
 		t.Fatal("order changed without an event")
@@ -187,10 +287,34 @@ func TestKafkaPendingBecomesPlaced(t *testing.T) {
 	rc.stop(t)
 }
 
-func TestKafkaDuplicatesAndSkippedRecords(t *testing.T) {
+// The consumer starts while its topic does not exist (nobody has published yet); the topic is created explicitly
+// at a late moment and the consumer must pick it up by itself.
+func TestKafkaTopicCreatedAfterTheConsumerStarted(t *testing.T) {
 	brokers := kafkaBrokers(t)
 	svc, _, _ := setup(t)
 	topic, group := uniq("orders.placed.it"), uniq("g")
+	id := uniq("ord")
+	createPending(t, svc, id)
+
+	rc := startConsumer(t, brokers, topic, group, svc)
+	time.Sleep(3 * time.Second) // the consumer is up and looking for a topic that is not there
+	if getOrder(t, svc, id).Status != pb.OrderStatus_ORDER_STATUS_PENDING {
+		t.Fatal("order changed without a topic")
+	}
+	createTopic(t, brokers, topic)
+	produceEvent(t, brokers, topic, id, "TRK-1", "TXN-1")
+
+	until(t, "order PLACED after the topic appeared", isPlaced(t, svc, id))
+	if got := rc.h.calls(); len(got) != 1 || got[0] != id {
+		t.Errorf("handled %v", got)
+	}
+	rc.stop(t)
+}
+
+func TestKafkaDuplicatesAndSkippedRecords(t *testing.T) {
+	brokers := kafkaBrokers(t)
+	svc, _, _ := setup(t)
+	topic, group := newTopic(t, brokers), uniq("g")
 	a, b, failed, other := uniq("a"), uniq("b"), uniq("f"), uniq("other")
 	createPending(t, svc, a)
 	createPending(t, svc, b)
@@ -229,7 +353,7 @@ func TestKafkaDuplicatesAndSkippedRecords(t *testing.T) {
 func TestKafkaRestartResumesAfterCommittedOffset(t *testing.T) {
 	brokers := kafkaBrokers(t)
 	svc, _, _ := setup(t)
-	topic, group := uniq("orders.placed.it"), uniq("g")
+	topic, group := newTopic(t, brokers), uniq("g")
 	first, second := uniq("first"), uniq("second")
 	createPending(t, svc, first)
 	createPending(t, svc, second)
@@ -255,7 +379,7 @@ func TestKafkaRestartResumesAfterCommittedOffset(t *testing.T) {
 func TestKafkaTransientFailureIsRetriedNotSkipped(t *testing.T) {
 	brokers := kafkaBrokers(t)
 	svc, _, _ := setup(t)
-	topic, group := uniq("orders.placed.it"), uniq("g")
+	topic, group := newTopic(t, brokers), uniq("g")
 	first, second := uniq("first"), uniq("second")
 	createPending(t, svc, first)
 	createPending(t, svc, second)
@@ -328,7 +452,7 @@ func freeAddr(t *testing.T) string {
 func TestKafkaBrokerUnavailableAtStartThenAvailable(t *testing.T) {
 	brokers := kafkaBrokers(t)
 	svc, _, _ := setup(t)
-	topic, group := uniq("orders.placed.it"), uniq("g")
+	topic, group := newTopic(t, brokers), uniq("g")
 	id := uniq("ord")
 	createPending(t, svc, id)
 	produceEvent(t, brokers, topic, id, "TRK-1", "TXN-1")
@@ -353,7 +477,7 @@ func TestKafkaConsumerRecoversFromBrokerRestart(t *testing.T) {
 		t.Skip("TEST_KAFKA_CONTAINER not set")
 	}
 	svc, _, _ := setup(t)
-	topic, group := uniq("orders.placed.it"), uniq("g")
+	topic, group := newTopic(t, brokers), uniq("g")
 	before, after := uniq("before"), uniq("after")
 	createPending(t, svc, before)
 	createPending(t, svc, after)
@@ -366,7 +490,7 @@ func TestKafkaConsumerRecoversFromBrokerRestart(t *testing.T) {
 	}
 	// the broker needs a while to come back; produce retries until it does
 	var perr error
-	deadline := time.Now().Add(120 * time.Second)
+	deadline := time.Now().Add(180 * time.Second)
 	for time.Now().Before(deadline) {
 		if perr = tryProduce(brokers, topic, after); perr == nil {
 			break
@@ -376,7 +500,8 @@ func TestKafkaConsumerRecoversFromBrokerRestart(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("broker did not come back: %v", perr)
 	}
-	until(t, "order placed after the broker restart", isPlaced(t, svc, after))
+	// after the restart the consumer has to rejoin its group, which can take up to the group's rebalance timeout
+	untilWithin(t, 180*time.Second, "order placed after the broker restart", isPlaced(t, svc, after))
 	rc.stop(t)
 	if got := rc.h.calls(); len(got) != 2 || got[0] != before || got[1] != after {
 		t.Errorf("handled %v, want [before after] (no replay of the committed record)", got)
@@ -384,12 +509,12 @@ func TestKafkaConsumerRecoversFromBrokerRestart(t *testing.T) {
 }
 
 func tryProduce(brokers, topic, orderID string) error {
-	cl, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...), kgo.AllowAutoTopicCreation())
+	cl, err := tolerantProducer(brokers)
 	if err != nil {
 		return err
 	}
 	defer cl.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Key: []byte(orderID), Value: eventValue(orderID, "TRK-2", "TXN-2")}).FirstErr(); err != nil {
 		return errors.Join(err)
