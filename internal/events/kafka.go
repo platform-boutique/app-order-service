@@ -20,10 +20,13 @@ type kgoSource struct {
 // off) as a member of cfg.Group on Topic. A new group starts at the earliest offset. Auto commit is off and
 // rebalances are blocked while a polled batch is being handled, so a partition is never taken away mid-batch.
 func NewKafkaSource(cfg Config, log *logrus.Logger) (Source, error) {
+	if cfg.Topic == "" {
+		cfg.Topic = Topic
+	}
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.Group),
-		kgo.ConsumeTopics(Topic),
+		kgo.ConsumeTopics(cfg.Topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
 		kgo.BlockRebalanceOnPoll(),

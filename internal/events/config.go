@@ -7,6 +7,8 @@ import "strings"
 type Config struct {
 	Brokers []string
 	Group   string
+	// Topic is Topic ("orders.placed") unless set; there is no environment variable for it, only tests set it.
+	Topic string
 }
 
 // DefaultGroup is the consumer group when KAFKA_CONSUMER_GROUP is not set.
@@ -14,7 +16,7 @@ const DefaultGroup = "order-service"
 
 // ConfigFromEnv reads the configuration; getenv is os.Getenv in production.
 func ConfigFromEnv(getenv func(string) string) Config {
-	c := Config{Group: strings.TrimSpace(getenv("KAFKA_CONSUMER_GROUP"))}
+	c := Config{Topic: Topic, Group: strings.TrimSpace(getenv("KAFKA_CONSUMER_GROUP"))}
 	if c.Group == "" {
 		c.Group = DefaultGroup
 	}
