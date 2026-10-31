@@ -40,13 +40,47 @@ import (
 
 const kafkaWait = 60 * time.Second
 
+var warmOnce sync.Once
+
 func kafkaBrokers(t *testing.T) string {
 	t.Helper()
 	b := os.Getenv("TEST_KAFKA_BROKERS")
 	if b == "" {
 		t.Skip("TEST_KAFKA_BROKERS not set")
 	}
+	warmOnce.Do(func() { warmUpGroupCoordinator(t, b) })
 	return b
+}
+
+// warmUpGroupCoordinator waits until the broker can serve consumer groups. A freshly started broker creates and loads
+// the 50 partitions of __consumer_offsets on the first group request, and until then answers COORDINATOR_NOT_AVAILABLE
+// / NOT_COORDINATOR; on a loaded host that took 10-60 s and made the first test of a run slow. That is the broker's
+// warm-up, not the consumer's behaviour, so it is paid here once, outside any test's own waits.
+func warmUpGroupCoordinator(t *testing.T, brokers string) {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*kafkaWait)
+	defer cancel()
+	group := uniq("warmup")
+	var last error
+	for ctx.Err() == nil {
+		req := kmsg.NewOffsetFetchRequest()
+		req.Group = group
+		resp, err := req.RequestWith(ctx, cl)
+		last = err
+		if err == nil {
+			last = kerr.ErrorForCode(resp.ErrorCode)
+		}
+		if last == nil {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("group coordinator not ready: %v", last)
 }
 
 var seq atomic.Int64
@@ -215,6 +249,10 @@ func startConsumer(t *testing.T, brokers, topic, group string, svc *orders.Servi
 	t.Helper()
 	l := logrus.New()
 	l.Out = io.Discard
+	if os.Getenv("TEST_KAFKA_DEBUG") != "" { // kafka client + consumer logs of the test, for diagnosing slow runs
+		l.Out = os.Stderr
+		l.SetLevel(logrus.DebugLevel)
+	}
 	src, err := events.NewKafkaSource(events.Config{Brokers: strings.Split(brokers, ","), Group: group, Topic: topic}, l)
 	if err != nil {
 		t.Fatal(err)

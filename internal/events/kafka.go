@@ -96,7 +96,15 @@ func (s *kgoSource) Close() { s.cl.CloseAllowingRebalance() }
 // kgoLogger passes franz-go's warnings and errors to logrus (its info/debug chatter stays off).
 type kgoLogger struct{ l *logrus.Logger }
 
-func (kgoLogger) Level() kgo.LogLevel { return kgo.LogLevelWarn }
+// Level follows the logrus level, but never goes below warn: info and debug chatter only with a debug/trace logger.
+func (k kgoLogger) Level() kgo.LogLevel {
+	switch {
+	case k.l.IsLevelEnabled(logrus.DebugLevel):
+		return kgo.LogLevelDebug
+	default:
+		return kgo.LogLevelWarn
+	}
+}
 
 func (k kgoLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
 	f := logrus.Fields{}
@@ -104,9 +112,12 @@ func (k kgoLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
 		f[fmt.Sprint(keyvals[i])] = keyvals[i+1]
 	}
 	e := k.l.WithFields(f)
-	if level == kgo.LogLevelError {
+	switch level {
+	case kgo.LogLevelError:
 		e.Error("kafka client: " + msg)
-		return
+	case kgo.LogLevelWarn:
+		e.Warn("kafka client: " + msg)
+	default:
+		e.Debug("kafka client: " + msg)
 	}
-	e.Warn("kafka client: " + msg)
 }
