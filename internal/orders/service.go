@@ -227,3 +227,22 @@ func (s *Service) ListOrders(ctx context.Context, req *pb.ListOrdersRequest) (*p
 	}
 	return resp, nil
 }
+
+// ClaimOrders gives the unowned orders of an anonymous session to a user. Idempotent; never touches orders that
+// already have a user_id.
+func (s *Service) ClaimOrders(ctx context.Context, req *pb.ClaimOrdersRequest) (*pb.ClaimOrdersResponse, error) {
+	sessionID, userID, err := ValidateClaim(req)
+	if err != nil {
+		return nil, s.toStatus("ClaimOrders", err)
+	}
+	if err := s.checkReady(); err != nil {
+		return nil, err
+	}
+	n, err := s.store.Claim(ctx, sessionID, userID)
+	if err != nil {
+		return nil, s.toStatus("ClaimOrders", err)
+	}
+	// only the count is logged: the session id is a browser cookie value and stays out of the logs
+	s.log.WithFields(logrus.Fields{"claimed": n}).Info("[ClaimOrders] orders claimed")
+	return &pb.ClaimOrdersResponse{Claimed: clampInt32(n)}, nil
+}

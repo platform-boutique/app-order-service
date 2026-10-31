@@ -234,3 +234,16 @@ func TestValidateConfirmFailGet(t *testing.T) {
 		t.Errorf("plain get: %v %q %q %v", id, s, u, err)
 	}
 }
+
+func TestValidateClaim(t *testing.T) {
+	s, u, err := ValidateClaim(&pb.ClaimOrdersRequest{SessionId: " sess ", UserId: "user"})
+	if err != nil || s != "sess" || u != "user" {
+		t.Errorf("valid claim: %q %q %v", s, u, err)
+	}
+	for _, r := range []*pb.ClaimOrdersRequest{nil, {}, {SessionId: "s"}, {UserId: "u"},
+		{SessionId: strings.Repeat("s", 129), UserId: "u"}, {SessionId: "s", UserId: strings.Repeat("u", 129)}} {
+		if _, _, err := ValidateClaim(r); !errors.Is(err, ErrInvalid) {
+			t.Errorf("ValidateClaim(%v): %v", r, err)
+		}
+	}
+}

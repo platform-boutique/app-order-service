@@ -121,4 +121,21 @@ func (m *memStore) List(_ context.Context, f Filter, limit, offset int64) ([]Ord
 	return all[offset:min(offset+limit, total)], total, nil
 }
 
+func (m *memStore) Claim(_ context.Context, sessionID, userID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return 0, m.err
+	}
+	var n int64
+	for id, o := range m.orders {
+		if o.SessionID == sessionID && o.UserID == "" {
+			o.UserID = userID
+			m.orders[id] = o
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *memStore) Ping(context.Context) error { return m.err }

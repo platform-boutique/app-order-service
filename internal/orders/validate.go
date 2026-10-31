@@ -321,6 +321,15 @@ func ValidateGet(req *pb.GetOrderRequest) (id, sessionGuard, userGuard string, e
 	return
 }
 
+// ValidateClaim checks ClaimOrders: both ids are required, 1-128 characters.
+func ValidateClaim(req *pb.ClaimOrdersRequest) (sessionID, userID string, err error) {
+	if sessionID, err = text("session_id", req.GetSessionId(), 1, MaxSessionIDLen); err != nil {
+		return
+	}
+	userID, err = text("user_id", req.GetUserId(), 1, MaxUserIDLen)
+	return
+}
+
 // Filter selects the orders of ListOrders.
 type Filter struct {
 	SessionID  string

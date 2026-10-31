@@ -32,6 +32,11 @@ service OrderService {
   rpc GetOrder(GetOrderRequest) returns (Order);
   // ListOrders returns one page of the orders of ONE session or ONE user, newest first.
   rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+  // ClaimOrders gives the orders of an anonymous session to a user: every order with this
+  // session_id whose user_id is EMPTY gets user_id set. Orders that already belong to a user
+  // are never touched (so a second user on the same browser cannot take them). Idempotent:
+  // repeating returns claimed = 0. INVALID_ARGUMENT when session_id or user_id is empty.
+  rpc ClaimOrders(ClaimOrdersRequest) returns (ClaimOrdersResponse);
 }
 
 enum OrderStatus {
@@ -114,6 +119,14 @@ message ListOrdersRequest {
 message ListOrdersResponse {
   repeated Order orders = 1;
   int32 total = 2; // all matching orders, not just this page
+}
+
+message ClaimOrdersRequest {
+  string session_id = 1;  // 1-128 characters
+  string user_id = 2;     // 1-128 characters
+}
+message ClaimOrdersResponse {
+  int32 claimed = 1;      // orders changed by THIS call
 }
 
 message Order {

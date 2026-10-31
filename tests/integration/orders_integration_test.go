@@ -458,3 +458,138 @@ func TestUnreachableDatabase(t *testing.T) {
 		t.Error("Setup succeeded without a database")
 	}
 }
+
+func claim(t *testing.T, svc *orders.Service, session, user string) int32 {
+	t.Helper()
+	r, err := svc.ClaimOrders(context.Background(), &pb.ClaimOrdersRequest{SessionId: session, UserId: user})
+	if err != nil {
+		t.Fatalf("ClaimOrders(%s, %s): %v", session, user, err)
+	}
+	return r.Claimed
+}
+
+func TestClaimOrders(t *testing.T) {
+	svc, p, _ := setup(t)
+	ctx := context.Background()
+	// sess-1: a PLACED, a PENDING and a FAILED order, all anonymous; sess-2 has one anonymous order;
+	// sess-3 has one that already belongs to user-x
+	for _, id := range []string{"c-placed", "c-pending", "c-failed"} {
+		if _, err := svc.CreateOrder(ctx, request(id, "sess-1", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := svc.ConfirmOrder(ctx, confirm("c-placed")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.FailOrder(ctx, &pb.FailOrderRequest{OrderId: "c-failed", Reason: "declined"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateOrder(ctx, request("d-other", "sess-2", "")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateOrder(ctx, request("e-owned", "sess-3", "user-x")); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := claim(t, svc, "sess-1", "user-1"); n != 3 {
+		t.Fatalf("first claim = %d, want 3 (PLACED, PENDING and FAILED)", n)
+	}
+	if n := claim(t, svc, "sess-1", "user-1"); n != 0 {
+		t.Errorf("same user again = %d, want 0", n)
+	}
+	if n := claim(t, svc, "sess-1", "user-2"); n != 0 {
+		t.Errorf("another user on the claimed session = %d, want 0", n)
+	}
+	if n := claim(t, svc, "sess-3", "user-2"); n != 0 {
+		t.Errorf("claim over an order that has a user = %d, want 0", n)
+	}
+	if n := claim(t, svc, "no-such-session", "user-2"); n != 0 {
+		t.Errorf("unknown session = %d, want 0", n)
+	}
+
+	// only the matching session was claimed, and the owner stayed where it was
+	var owner string
+	for id, want := range map[string]string{"c-placed": "user-1", "c-pending": "user-1", "c-failed": "user-1", "d-other": "", "e-owned": "user-x"} {
+		if err := p.QueryRow(ctx, `SELECT user_id FROM orders WHERE id = $1`, id).Scan(&owner); err != nil || owner != want {
+			t.Errorf("%s: user_id %q, %v (want %q)", id, owner, err, want)
+		}
+	}
+
+	// ListOrders by user returns them (all states), the placed filter keeps the PLACED one
+	r, err := svc.ListOrders(ctx, &pb.ListOrdersRequest{UserId: "user-1"})
+	if err != nil || r.Total != 3 || len(r.Orders) != 3 {
+		t.Fatalf("list by user: %v, %v", r, err)
+	}
+	r, err = svc.ListOrders(ctx, &pb.ListOrdersRequest{UserId: "user-1", PlacedOnly: true})
+	if err != nil || r.Total != 1 || r.Orders[0].OrderId != "c-placed" || r.Orders[0].UserId != "user-1" {
+		t.Fatalf("list by user, placed only: %v, %v", r, err)
+	}
+	if r, err = svc.ListOrders(ctx, &pb.ListOrdersRequest{UserId: "user-2"}); err != nil || r.Total != 0 {
+		t.Errorf("user-2 sees %v, %v", r, err)
+	}
+	// GetOrder with the user guard: the owner gets it, anyone else NOT_FOUND; the session id is kept
+	o, err := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "c-placed", UserId: "user-1"})
+	if err != nil || o.UserId != "user-1" || o.SessionId != "sess-1" {
+		t.Errorf("owner get: %v, %v", o, err)
+	}
+	if _, err := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "c-placed", UserId: "user-2"}); status.Code(err) != codes.NotFound {
+		t.Errorf("other user get: %v", err)
+	}
+	// the claimed order is still readable with its session guard
+	if _, err := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "c-placed", SessionId: "sess-1"}); err != nil {
+		t.Errorf("session get after claim: %v", err)
+	}
+}
+
+// Two users claim the same sessions at the same moment: per session exactly one wins every order.
+func TestConcurrentClaims(t *testing.T) {
+	svc, p, _ := setup(t)
+	ctx := context.Background()
+	const sessions, perSession = 12, 4
+	for s := 0; s < sessions; s++ {
+		for i := 0; i < perSession; i++ {
+			if _, err := svc.CreateOrder(ctx, request(fmt.Sprintf("o-%d-%d", s, i), fmt.Sprintf("sess-%d", s), "")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	type result struct{ a, b int32 }
+	res := make([]result, sessions)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for s := 0; s < sessions; s++ {
+		for u, user := range []string{"user-a", "user-b"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				r, err := svc.ClaimOrders(ctx, &pb.ClaimOrdersRequest{SessionId: fmt.Sprintf("sess-%d", s), UserId: user})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if u == 0 {
+					res[s].a = r.Claimed
+				} else {
+					res[s].b = r.Claimed
+				}
+			}()
+		}
+	}
+	close(start)
+	wg.Wait()
+	for s, r := range res {
+		if r.a+r.b != perSession || (r.a != 0 && r.b != 0) {
+			t.Errorf("session %d: user-a claimed %d, user-b claimed %d (want one winner with %d)", s, r.a, r.b, perSession)
+		}
+		// all orders of one session ended with the same single owner
+		var owners int
+		if err := p.QueryRow(ctx, `SELECT count(DISTINCT user_id) FROM orders WHERE session_id = $1`, fmt.Sprintf("sess-%d", s)).Scan(&owners); err != nil || owners != 1 {
+			t.Errorf("session %d has %d owners, %v", s, owners, err)
+		}
+	}
+	var unowned int64
+	if err := p.QueryRow(ctx, `SELECT count(*) FROM orders WHERE user_id = ''`).Scan(&unowned); err != nil || unowned != 0 {
+		t.Errorf("%d orders left unowned, %v", unowned, err)
+	}
+}

@@ -25,6 +25,9 @@ type Store interface {
 	Fail(ctx context.Context, id, reason string, now time.Time) (Order, error)
 	// List returns one page of the matching orders, newest first, plus the total number of matches.
 	List(ctx context.Context, f Filter, limit, offset int64) (page []Order, total int64, err error)
+	// Claim sets user_id on every order of the session whose user_id is empty (one conditional UPDATE) and
+	// returns the number of rows changed. Orders that already have a user are never touched.
+	Claim(ctx context.Context, sessionID, userID string) (int64, error)
 	// Ping checks that the database answers.
 	Ping(ctx context.Context) error
 }
@@ -265,6 +268,16 @@ func (s *PGStore) List(ctx context.Context, f Filter, limit, offset int64) ([]Or
 		return nil, 0, classify(err)
 	}
 	return page, total, nil
+}
+
+// Claim implements Store: one statement, so two concurrent claims of the same session cannot both win a row
+// (the second UPDATE re-checks the empty user_id after the first one commits).
+func (s *PGStore) Claim(ctx context.Context, sessionID, userID string) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE orders SET user_id = $2 WHERE session_id = $1 AND user_id = ''`, sessionID, userID)
+	if err != nil {
+		return 0, classify(err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // Ping implements Store.

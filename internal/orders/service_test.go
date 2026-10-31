@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -339,6 +340,10 @@ func TestNotReadyAndStorageErrors(t *testing.T) {
 		"fail":    func() error { _, e := svc.FailOrder(ctx, &pb.FailOrderRequest{OrderId: "o", Reason: "r"}); return e },
 		"get":     func() error { _, e := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "o"}); return e },
 		"list":    func() error { _, e := svc.ListOrders(ctx, &pb.ListOrdersRequest{SessionId: "s"}); return e },
+		"claim": func() error {
+			_, e := svc.ClaimOrders(ctx, &pb.ClaimOrdersRequest{SessionId: "s", UserId: "u"})
+			return e
+		},
 	} {
 		if status.Code(f()) != codes.Unavailable {
 			t.Errorf("%s while not ready: %v", name, f())
@@ -386,6 +391,9 @@ func TestNilRequestsDoNotPanic(t *testing.T) {
 	if _, err := svc.ListOrders(ctx, nil); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("ListOrders(nil): %v", err)
 	}
+	if _, err := svc.ClaimOrders(ctx, nil); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("ClaimOrders(nil): %v", err)
+	}
 }
 
 func TestConcurrentCreateAndConfirm(t *testing.T) {
@@ -405,4 +413,88 @@ func TestConcurrentCreateAndConfirm(t *testing.T) {
 	if len(st.orders) != 1 || st.orders["ord-1"].State != StatePlaced {
 		t.Errorf("orders %d, state %s", len(st.orders), st.orders["ord-1"].State)
 	}
+}
+
+func TestClaimOrders(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	ctx := context.Background()
+	for _, id := range []string{"ord-1", "ord-2"} {
+		r := validRequest()
+		r.OrderId = id
+		if _, err := svc.CreateOrder(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := validRequest()
+	other.OrderId, other.SessionId = "ord-3", "sess-2"
+	if _, err := svc.CreateOrder(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+
+	claim := func(session, user string) int32 {
+		t.Helper()
+		resp, err := svc.ClaimOrders(ctx, &pb.ClaimOrdersRequest{SessionId: session, UserId: user})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Claimed
+	}
+	if n := claim("sess-1", "user-1"); n != 2 {
+		t.Fatalf("first claim = %d, want 2", n)
+	}
+	if n := claim("sess-1", "user-1"); n != 0 {
+		t.Errorf("repeated claim = %d, want 0", n)
+	}
+	if n := claim("sess-1", "user-2"); n != 0 {
+		t.Errorf("claim by a second user = %d, want 0", n)
+	}
+	if n := claim("nobody", "user-2"); n != 0 {
+		t.Errorf("claim of an unknown session = %d, want 0", n)
+	}
+	got, err := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "ord-1", UserId: "user-1"})
+	if err != nil || got.UserId != "user-1" || got.SessionId != "sess-1" {
+		t.Fatalf("claimed order: %v, %v", got, err)
+	}
+	_, err = svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "ord-1", UserId: "user-2"})
+	wantCode(t, err, codes.NotFound)
+	// the other session was not touched
+	if o, err := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "ord-3"}); err != nil || o.UserId != "" {
+		t.Errorf("order of another session: %v, %v", o, err)
+	}
+}
+
+func TestClaimOrdersInvalid(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	for name, req := range map[string]*pb.ClaimOrdersRequest{
+		"empty":          {},
+		"no user":        {SessionId: "s"},
+		"no session":     {UserId: "u"},
+		"blank user":     {SessionId: "s", UserId: "   "},
+		"long session":   {SessionId: strings.Repeat("s", 129), UserId: "u"},
+		"long user":      {SessionId: "s", UserId: strings.Repeat("u", 129)},
+		"nul in session": {SessionId: "s\x00", UserId: "u"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.ClaimOrders(context.Background(), req)
+			wantCode(t, err, codes.InvalidArgument)
+		})
+	}
+	// the limits themselves are accepted
+	_, err := svc.ClaimOrders(context.Background(), &pb.ClaimOrdersRequest{SessionId: strings.Repeat("s", 128), UserId: strings.Repeat("u", 128)})
+	if err != nil {
+		t.Errorf("128 characters: %v", err)
+	}
+}
+
+func TestClaimOrdersStorageError(t *testing.T) {
+	svc, st, _ := newTestService(t)
+	st.err = errors.New("ERROR: boom (SQLSTATE 42P01)")
+	_, err := svc.ClaimOrders(context.Background(), &pb.ClaimOrdersRequest{SessionId: "s", UserId: "u"})
+	wantCode(t, err, codes.Internal)
+	if status.Convert(err).Message() != "internal error" {
+		t.Errorf("SQL detail leaked: %q", status.Convert(err).Message())
+	}
+	st.err = ErrUnavailable
+	_, err = svc.ClaimOrders(context.Background(), &pb.ClaimOrdersRequest{SessionId: "s", UserId: "u"})
+	wantCode(t, err, codes.Unavailable)
 }
