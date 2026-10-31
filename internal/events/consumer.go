@@ -116,8 +116,9 @@ func (c *Consumer) Run(ctx context.Context) {
 		}
 		handled := make([]Record, 0, len(recs))
 		for _, rec := range recs {
-			if !c.handleRecord(ctx, rec) {
-				break // shutdown while this record was still failing: it is not committed
+			if ctx.Err() != nil || !c.handleRecord(ctx, rec) {
+				// shutdown: the record that was in flight is done, the rest is left for the next start
+				break
 			}
 			handled = append(handled, rec)
 		}
