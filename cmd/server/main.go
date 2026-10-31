@@ -183,6 +183,9 @@ func run(port, dsn string, profiling bool) error {
 	// --- Database: migrate (retrying until the DB is reachable), then watch it ---
 	go watchDatabase(ctx, pool, store, svc, healthSrv)
 
+	// --- Kafka: orders.placed consumer (self-healing confirm), only with KAFKA_BROKERS set; stopped before the pool closes ---
+	defer startKafka(ctx, svc)()
+
 	serveErr := make(chan error, 1)
 	go func() {
 		log.Infof("starting grpc server on %s", listener.Addr().String())
