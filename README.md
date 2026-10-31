@@ -79,6 +79,8 @@ The offsets are all measured from the confirmation (defaults 1m, 3m, 6m). In cod
 | `ORDER_PROCESSING_AFTER` | `1m` | Offset after confirmation at which `PLACED` becomes `PROCESSING` (Go duration: `90s`, `2m`) |
 | `ORDER_SHIPPED_AFTER` | `3m` | Offset at which it becomes `SHIPPED` |
 | `ORDER_DELIVERED_AFTER` | `6m` | Offset at which it becomes `DELIVERED`. Must satisfy `0 < processing < shipped < delivered`, otherwise the process exits at start-up |
+| `KAFKA_BROKERS` | empty (Kafka off) | Comma-separated bootstrap servers, e.g. `kafka:9092`. Empty: the consumer is not started, nothing is registered on `/metrics`, the service behaves exactly as before |
+| `KAFKA_CONSUMER_GROUP` | `order-service` | Consumer group of the `orders.placed` consumer |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | OTLP/**gRPC** endpoint for traces, metrics and logs (scheme required). Legacy fallback: `COLLECTOR_SERVICE_ADDR` (`host:port`). Telemetry is on only if one of them is set and non-empty |
 | `OTEL_SDK_DISABLED` | — | `true` forces telemetry off even with an endpoint (the legacy `ENABLE_TRACING=0` does the same) |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | Milliseconds between metric pushes |
@@ -87,6 +89,45 @@ The offsets are all measured from the confirmation (defaults 1m, 3m, 6m). In cod
 | `ENABLE_PROFILING` | — | `0` forces profiling off |
 
 Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background loop runs the goose migrations (under goose's Postgres session advisory lock, so replicas starting together apply each migration once), retrying every 2 s until the database is reachable. There is no seed data. SIGTERM/SIGINT: health goes `NOT_SERVING`, `GracefulStop` (10 s cap), then the pool is closed and the process exits 0.
+
+## Kafka consumer
+
+With `KAFKA_BROKERS` set, the service consumes the topic `orders.placed` (key = order id, JSON value, schema version 1; the contract is owned by checkout, which publishes it) and confirms the order from each event. This is the self-healing path: if checkout published the event but its own `ConfirmOrder` call was lost, the order is still moved from `PENDING` to `PLACED` by the event. The handler goes through the same code as the `ConfirmOrder` RPC (`ValidateConfirm`, then the store transition under a row lock) via `Service.ConfirmFromEvent`; the topic name is a constant, the only settings are the two variables in the table above.
+
+| Case | What happens |
+|---|---|
+| Order `PENDING` | `PENDING -> PLACED` with the event's `shipping_tracking_id` / `payment_transaction_id`; info log |
+| Order already `PLACED` with the same ids (replay, or the RPC got there first) | no-op, counted as processed |
+| Order `PLACED` with different tracking/transaction ids | not applied; error log; skipped |
+| Order `FAILED` | never resurrected; error log `order.placed for a FAILED order order=<id>`; skipped |
+| Unknown order id (event from another environment) | warn log; skipped |
+| Tracking/transaction id empty or too long (breaks the RPC contract) | warn log; skipped |
+| Malformed JSON, wrong field types, empty `order_id`, other `event_type` | warn log with topic/partition/offset; skipped |
+| `schema_version` missing, invalid or not 1 | warn log with topic/partition/offset; skipped (checked before the other fields, so a future schema with changed types lands here) |
+| Unknown JSON fields | ignored |
+| Database down, service not ready, handler timeout (any error that is not one of the cases above) | retried with backoff 0.5 s doubling to 30 s, the same record, **never skipped**; later records wait behind it; the process does not exit |
+
+Delivery is at-least-once, handling is idempotent. Offsets are committed by hand (auto commit is off) after a polled batch has been handled, skipped records included; if a commit fails the records are simply handled again after a restart or rebalance and recognised as replays. A new group starts at the earliest offset. A topic that does not exist yet is waited for (the client re-reads the topic metadata at least every 15 s). The consumer does not poll before the database is migrated and reachable (the same readiness as the gRPC health), and the health check never looks at Kafka: Kafka down or slow changes nothing about SERVING/NOT_SERVING.
+
+Shutdown: on SIGTERM the consumer finishes (and commits) the record it is handling, handles no further record of the batch, leaves the group and closes; one handling attempt is capped at 3 s and the commit at 3 s, and the process waits at most 8 s for it (inside the existing shutdown path, before the pool is closed).
+
+Logs carry `order_id`, `topic`, `partition`, `offset` and never the payload (the event holds the customer's email and address). Metrics on the existing `/metrics`:
+
+| Metric | Meaning |
+|---|---|
+| `order_service_kafka_events_processed_total{result}` | `confirmed` or `already_placed` |
+| `order_service_kafka_events_skipped_total{reason}` | `malformed`, `unsupported_schema`, `unknown_order`, `failed_order`, `conflict`, `invalid` |
+| `order_service_kafka_events_failed_total` | handling attempts that failed with a transient error |
+| `order_service_kafka_events_retried_total` | retries started after a backoff (differs from `failed` only when shutdown cuts a retry short) |
+| `order_service_kafka_offset_commits_total{result}` | `ok` / `error` |
+| `order_service_kafka_consumer_lag{partition}` | high watermark minus the next offset, as of the last handled record of the partition (not updated while a partition is idle or after it moved to another replica) |
+
+Client: [franz-go](https://github.com/twmb/franz-go) v1.22.2 (pure Go, no cgo). PLAINTEXT without authentication only (the local demo broker); TLS/SASL options are not wired.
+
+What was run and what was not:
+
+- Run (see the commands under "Running locally"): unit tests for event parsing (valid, unknown fields, schema version 0/2/missing/string, malformed, truncated), `ConfirmFromEvent` against the in-memory store (all cases in the table), the handler's outcome mapping and log content, and the consumer loop with a fake record source and fake sleep (batch commit, skips, retry then success in order without skipping, shutdown during a retry, record in flight at shutdown, poll and commit failures). Integration tests (build tag `integration`) against a throwaway single-node `apache/kafka:4.3.2` and `postgres:17-alpine`: `PENDING -> PLACED` with the topic created after the consumer started, duplicate / conflicting / FAILED / unknown / malformed / schema-2 records in one partition, restart of the consumer resuming after the committed offset, a transient failure retried and not skipped, the broker unreachable at start and then reachable (through a late-started TCP forwarder), and a `docker restart` of the broker while the consumer runs.
+- Not run: the container image with the consumer, the compose stack end to end with checkout publishing, more than one consumer instance in the same group (rebalancing between two replicas), a multi-broker cluster, TLS/SASL, a poison record that fails with a permanent database error (it would be retried forever by design; the warn log shows the attempt count).
 
 ## Storage
 
@@ -129,6 +170,19 @@ docker run -d --rm --name order-it-pg --memory 256m -e POSTGRES_USER=order -e PO
 TEST_DATABASE_URL='postgres://order:order@127.0.0.1:55433/postgres?sslmode=disable' \
   go test -race -tags integration ./...
 
+# Kafka consumer integration tests: a throwaway single-node broker (~40 s to start) plus the Postgres above
+docker run -d --rm --name order-it-kafka --hostname order-it-kafka --memory 768m -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=broker,controller -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:19092 -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 -e KAFKA_NUM_PARTITIONS=3 -e KAFKA_HEAP_OPTS="-Xms256m -Xmx384m" \
+  -p 127.0.0.1:19092:9092 apache/kafka:4.3.2
+TEST_DATABASE_URL='postgres://order:order@127.0.0.1:55433/postgres?sslmode=disable' \
+TEST_KAFKA_BROKERS=127.0.0.1:19092 TEST_KAFKA_CONTAINER=order-it-kafka \
+  go test -race -count=1 -tags integration ./tests/integration/   # Kafka tests skip without TEST_KAFKA_BROKERS
+
 # container smoke run: image + a Postgres with its own database and user on one docker network
 docker build -t platform-demo/order-service:local .
 docker network create order-smoke
@@ -138,7 +192,9 @@ docker run -d --name order-smoke-svc --network order-smoke -p 127.0.0.1:58085:80
   -e ORDER_PROCESSING_AFTER=5s -e ORDER_SHIPPED_AFTER=10s -e ORDER_DELIVERED_AFTER=15s platform-demo/order-service:local
 ```
 
-The smoke run (with the 5/10/15 s offsets) checked: health `SERVING` and Docker health `healthy`; create, repeated create, confirm and the status going `PLACED` -> `PROCESSING` -> `SHIPPED` -> `DELIVERED` while polling `GetOrder`; `NOT_FOUND` for a foreign session; `INVALID_ARGUMENT` for a wrong total and for list with both owners; `ALREADY_EXISTS` for other content under the same id; `FAILED_PRECONDITION` for failing a placed order; `ListOrders` with `placed_only`; health `NOT_SERVING` + `UNAVAILABLE` after disconnecting the database from the network and `SERVING` again after reconnecting it; the order still there after restarting the service container; user `10001`; exit code 0 on `docker stop`.
+The Kafka consumer was also run as a plain binary (not the image) against that broker and Postgres: with `KAFKA_BROKERS` set an order created over gRPC and a published `order.placed` ended `PLACED` with the event's tracking id, the five metrics above appeared on `:9090/metrics`, and SIGTERM stopped the process in about 0.1 s with the log line `stopped`; with `KAFKA_BROKERS` empty no Kafka metric exists and the log says the consumer is off; with `KAFKA_BROKERS=127.0.0.1:1` (nothing there) health stayed `SERVING`, the client logged one warning every few seconds and SIGTERM exited 0.
+
+The smoke run of the image (with the 5/10/15 s offsets) checked: health `SERVING` and Docker health `healthy`; create, repeated create, confirm and the status going `PLACED` -> `PROCESSING` -> `SHIPPED` -> `DELIVERED` while polling `GetOrder`; `NOT_FOUND` for a foreign session; `INVALID_ARGUMENT` for a wrong total and for list with both owners; `ALREADY_EXISTS` for other content under the same id; `FAILED_PRECONDITION` for failing a placed order; `ListOrders` with `placed_only`; health `NOT_SERVING` + `UNAVAILABLE` after disconnecting the database from the network and `SERVING` again after reconnecting it; the order still there after restarting the service container; user `10001`; exit code 0 on `docker stop`.
 `golangci-lint run` (default linters, also with `-tags integration`) and `gosec -exclude-generated ./...` report no issues. `govulncheck` was tried but crashed on the toolchain ("package without types"), so no vulnerability scan was done.
 
 Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto --go_opt=paths=source_relative --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/orders.proto` (protoc 3.21.12, protoc-gen-go 1.36.11, protoc-gen-go-grpc 1.6.1).
@@ -148,6 +204,7 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 ```
 ├── cmd/server/
 │   ├── main.go            # entrypoint: telemetry, profiling, gRPC server, DB watcher, graceful shutdown
+│   ├── kafka.go           # starts/stops the orders.placed consumer (KAFKA_BROKERS)
 │   ├── config.go          # ORDER_*_AFTER stage offsets
 │   ├── otlp.go            # OTLP traces/metrics/logs (same as review-service)
 │   └── healthcheck.go     # `order-service healthcheck` for the container HEALTHCHECK
@@ -155,9 +212,11 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 │   ├── service.go         # gRPC handlers, error mapping, computed status in the response
 │   ├── validate.go        # request limits, money arithmetic, paging
 │   ├── order.go           # stored states, Confirm/Fail transitions, status Schedule
+│   ├── placed_event.go    # ConfirmFromEvent: ConfirmOrder for the consumer, with an outcome per case
 │   ├── store.go           # Postgres store (pgx/v5)
 │   ├── migrate.go         # goose migrations, Setup
 │   └── migrations/        # embedded SQL migrations
+├── internal/events/       # orders.placed consumer: event parsing, handler, poll/handle/commit loop, franz-go source, metrics
 ├── proto/                 # orders.proto + generated Go
 ├── tests/integration/     # tests against a real Postgres (build tag `integration`)
 └── Dockerfile
@@ -170,4 +229,4 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 - `zip_code` is an `int32` to stay compatible with `hipstershop.Address`, so postal codes with letters or leading zeros do not fit.
 - Offset paging (page limit 1,000,000); `ListOrders` reads the total and the page in separate statements.
 - Database calls do not produce trace spans (no pgx tracer).
-- The smoke-run used the final code of this tree; arm64 was not built.
+- The image smoke run predates the Kafka consumer (the image was not rebuilt with it: not run); arm64 was not built.
