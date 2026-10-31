@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,6 +104,66 @@ func TestCreateOrderIdempotent(t *testing.T) {
 	again, err := svc.CreateOrder(context.Background(), validRequest())
 	if err != nil || again.Status != pb.OrderStatus_ORDER_STATUS_PLACED {
 		t.Errorf("retry after confirm: %v %v", again, err)
+	}
+}
+
+func TestCreateOrderCreatedFlag(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	ctx := context.Background()
+	first, err := svc.CreateOrder(ctx, validRequest())
+	if err != nil || first.Created == nil || !*first.Created {
+		t.Fatalf("first call must report created=true: %v %v", first, err)
+	}
+	replay, err := svc.CreateOrder(ctx, validRequest())
+	if err != nil || replay.Created == nil || *replay.Created {
+		t.Errorf("replay must report created=false (present, not unset): %v %v", replay, err)
+	}
+	other := validRequest()
+	other.Email = "grace@example.com"
+	if _, err := svc.CreateOrder(ctx, other); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("other content: %v", err)
+	}
+	// no other RPC sets the flag (it stays unset, not false)
+	conf, err := svc.ConfirmOrder(ctx, confirmReq("ord-1"))
+	if err != nil || conf.Created != nil {
+		t.Errorf("ConfirmOrder: created %v err %v", conf.GetCreated(), err)
+	}
+	got, err := svc.GetOrder(ctx, &pb.GetOrderRequest{OrderId: "ord-1"})
+	if err != nil || got.Created != nil {
+		t.Errorf("GetOrder: created %v err %v", got.GetCreated(), err)
+	}
+	list, err := svc.ListOrders(ctx, &pb.ListOrdersRequest{SessionId: "sess-1"})
+	if err != nil || len(list.Orders) != 1 || list.Orders[0].Created != nil {
+		t.Errorf("ListOrders: %v %v", list, err)
+	}
+	r2 := validRequest()
+	r2.OrderId = "ord-2"
+	if _, err := svc.CreateOrder(ctx, r2); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := svc.FailOrder(ctx, &pb.FailOrderRequest{OrderId: "ord-2", Reason: "declined"})
+	if err != nil || failed.Created != nil {
+		t.Errorf("FailOrder: created %v err %v", failed.GetCreated(), err)
+	}
+}
+
+func TestCreateOrderCreatedFlagConcurrent(t *testing.T) {
+	svc, _, _ := newTestService(t)
+	const n = 20
+	var wg sync.WaitGroup
+	var trues atomic.Int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if o, err := svc.CreateOrder(context.Background(), validRequest()); err == nil && o.GetCreated() {
+				trues.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if trues.Load() != 1 {
+		t.Errorf("created=true on %d of %d parallel identical calls, want exactly 1", trues.Load(), n)
 	}
 }
 

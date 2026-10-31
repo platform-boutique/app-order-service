@@ -149,7 +149,10 @@ func (s *Service) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (
 		return nil, s.toStatus("CreateOrder", err)
 	}
 	s.log.WithFields(logrus.Fields{"order_id": o.ID, "items": len(o.Items), "created": created}).Info("[CreateOrder] order stored")
-	return s.toPB(o, now), nil
+	out := s.toPB(o, now)
+	// created comes from the INSERT itself (Store.Create), so of two parallel identical calls exactly one gets true.
+	out.Created = &created
+	return out, nil
 }
 
 // ConfirmOrder turns a PENDING order into PLACED.

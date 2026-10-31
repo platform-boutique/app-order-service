@@ -311,6 +311,54 @@ func TestConcurrentCreateSameID(t *testing.T) {
 	}
 }
 
+// The created flag comes from the INSERT: of many parallel identical calls exactly one reports created=true,
+// a later replay reports false, other content under the same id is still ALREADY_EXISTS.
+func TestCreatedFlagConcurrentAndReplay(t *testing.T) {
+	svc, p, _ := setup(t)
+	const n = 16
+	var wg sync.WaitGroup
+	var trues, falses atomic.Int32
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			o, err := svc.CreateOrder(context.Background(), request("ord-created", "sess-1", ""))
+			if err != nil {
+				t.Errorf("concurrent identical create: %v", err)
+				return
+			}
+			if o.GetCreated() {
+				trues.Add(1)
+			} else {
+				falses.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if trues.Load() != 1 || falses.Load() != n-1 {
+		t.Errorf("created=true on %d, false on %d (want 1 and %d)", trues.Load(), falses.Load(), n-1)
+	}
+	replay, err := svc.CreateOrder(context.Background(), request("ord-created", "sess-1", ""))
+	if err != nil || replay.Created == nil || replay.GetCreated() {
+		t.Errorf("replay: created=%v err=%v", replay.GetCreated(), err)
+	}
+	other := request("ord-created", "sess-1", "")
+	other.Email = "someone-else@example.com"
+	if _, err := svc.CreateOrder(context.Background(), other); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("different content: %v", err)
+	}
+	got, err := svc.GetOrder(context.Background(), &pb.GetOrderRequest{OrderId: "ord-created"})
+	if err != nil || got.Created != nil {
+		t.Errorf("GetOrder must not set created: %v %v", got.GetCreated(), err)
+	}
+	if c := count(t, p, "orders"); c != 1 {
+		t.Errorf("orders: %d", c)
+	}
+}
+
 // Confirm and Fail race on the same order: exactly one of them wins, the other gets FAILED_PRECONDITION.
 func TestConcurrentConfirmAndFail(t *testing.T) {
 	svc, _, _ := setup(t)
