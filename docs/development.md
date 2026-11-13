@@ -9,7 +9,7 @@ Commands run on 2026-11-13 for the standards change (host: Go 1.22 with `GOTOOLC
 | `go vet ./... && go test -race -count=1 ./...` | passed (3 packages with tests) |
 | `golangci-lint run ./...` and `golangci-lint run --build-tags integration ./...` (golangci-lint v2.11.4, `.golangci.yaml`) | 0 issues. The shared pipeline pins v2.14.0: not run |
 | `gofmt -l .` | no files listed |
-| `mkdocs build --strict` | see the README of the change; result is recorded in the commit message of the docs commit |
+| `mkdocs build --strict` (mkdocs 1.6.1, mkdocs-techdocs-core 1.7.1, Python 3.12 venv made with uv) | passed |
 
 ## What the earlier author ran (recorded, not re-run for this page)
 

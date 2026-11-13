@@ -141,7 +141,7 @@ Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker for integration te
 | Integration (Kafka) | see below | not run today |
 | Vulnerability / security scan | `govulncheck ./...`, `gosec -exclude-generated ./...` | not run today |
 | Image | `docker build -t platform-demo/order-service:local .` | not run today |
-| Docs | `mkdocs build --strict` (needs `mkdocs` + `mkdocs-techdocs-core`) | see `docs/development.md` |
+| Docs | `mkdocs build --strict` (mkdocs 1.6.1 + mkdocs-techdocs-core 1.7.1, Python 3.12 venv made with uv) | run, passed |
 
 Integration tests (build tag `integration`, each test creates and drops its own database; Kafka tests skip without `TEST_KAFKA_BROKERS`):
 
