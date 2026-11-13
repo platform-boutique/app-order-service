@@ -1,0 +1,26 @@
+site_name: order-service
+site_description: >-
+  A gRPC service that stores the orders of the Everly shop and reports their
+  tracking status.
+repo_url: https://github.com/platform-boutique/app-order-service
+edit_uri: edit/main/docs/
+nav:
+  - Overview: index.md
+  - Architecture: architecture.md
+  - API: api.md
+  - Configuration: configuration.md
+  - Observability: observability.md
+  - Operations: operations.md
+  - Develop & test: development.md
+  - Decisions:
+      - "1. One Postgres per service": adr/0001-one-postgres-per-service.md
+      - "2. Computed order status": adr/0002-computed-order-status.md
+      - "3. Kafka consumer": adr/0003-orders-placed-consumer.md
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+plugins:
+  - techdocs-core

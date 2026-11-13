@@ -1,0 +1,48 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: order-service
+  title: order-service
+  description: "A gRPC service that stores the orders of the Everly shop and reports their tracking status."
+  annotations:
+    github.com/project-slug: platform-boutique/app-order-service
+    backstage.io/source-location: url:https://github.com/platform-boutique/app-order-service/tree/main/
+    backstage.io/techdocs-ref: dir:.
+    grafana/dashboard-selector: "tags @> 'order'"
+    grafana/alert-label-selector: "service=order-service"
+  tags: [go, grpc, postgres, kafka]
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:default/maintainers
+  system: everly
+  providesApis: [order-service-api]
+  dependsOn:
+    - resource:default/order-db
+    - resource:default/kafka
+---
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: order-db
+  description: Postgres database owned by order-service (orders, order_items).
+spec:
+  type: database
+  owner: group:default/maintainers
+  system: everly
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: order-service-api
+  description: gRPC interface of order-service (Protocol Buffers).
+  tags: [grpc, protobuf]
+  links:
+    - { url: "https://github.com/platform-boutique/app-order-service/blob/main/proto/orders.proto", title: "orders.proto on GitHub", icon: code }
+spec:
+  type: grpc
+  lifecycle: experimental
+  owner: group:default/maintainers
+  system: everly
+  definition:
+    $text: ./proto/orders.proto
