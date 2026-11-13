@@ -1,233 +1,180 @@
 # order-service
 
-A gRPC service that stores the shop's orders and reports their tracking status. Checkout writes an order as `PENDING` before it charges and ships, then marks it `PLACED` (or `FAILED`). After that the status shown to clients advances with the age of the order (`PLACED` -> `PROCESSING` -> `SHIPPED` -> `DELIVERED`): it is **computed on every read**, nothing is stored for it and no timer or cron runs. It owns its own Postgres database and creates the schema with embedded migrations at start-up. Orders belong to a session id and, once the buyer is signed in, also to a user: checkout stores the account id as `user_id` and `ClaimOrders` hands the orders of an anonymous session to a user after login.
+## Purpose and place in the shop
 
-## At a glance
+A gRPC service that stores the orders of the Everly shop and reports their tracking status. Checkout writes an order as `PENDING` before it charges the card, then marks it `PLACED` (or `FAILED`). After that the status shown to clients advances with the age of the order (`PLACED` -> `PROCESSING` -> `SHIPPED` -> `DELIVERED`): it is **computed on every read**, nothing is stored for it and no timer runs. Orders belong to a session id and, once the buyer is signed in, also to a user (`ClaimOrders` hands the orders of an anonymous session to a user after login). The service owns its own Postgres database and creates the schema with embedded migrations at start-up. With `KAFKA_BROKERS` set it also consumes the topic `orders.placed` and confirms a still-`PENDING` order from the event (self-healing when checkout's `ConfirmOrder` call was lost).
+
+Context diagram and the main flow as sequence diagram: [`docs/architecture.md`](docs/architecture.md).
 
 | | |
 |---|---|
-| **Language / runtime** | Go 1.26 (static binary, `CGO_ENABLED=0`) |
-| **Image** | built locally only: `platform-demo/order-service:local` |
-| **Protocol / port** | gRPC (HTTP/2, plaintext) on `8085` |
-| **Metrics** | Prometheus `/metrics` on `9090`; pushed over OTLP/gRPC only when an endpoint is set |
-| **Health** | Standard `grpc.health.v1.Health/Check` on `8085`: `NOT_SERVING` until the migrations are done and whenever the database does not answer a ping (checked every 5 s) |
-| **State** | Postgres (`orders`, `order_items`), via `DATABASE_URL` |
-| **Depends on** | Its own Postgres (optional: OTLP collector, Pyroscope) |
-| **Called by** | checkout (`CreateOrder`, `ConfirmOrder`, `FailOrder`), frontend (`ListOrders`, `GetOrder`; `ClaimOrders` from the accounts branch, not merged yet) |
-| **gRPC reflection** | Enabled: `grpcurl` works without `-proto` |
+| Language / runtime | Go 1.26 (`go.mod`: `go 1.26.0`, `toolchain go1.26.10`), static binary, `CGO_ENABLED=0` |
+| Image | built locally only: `platform-demo/order-service:local` (`Dockerfile`, user `10001:10001`) |
+| Ports | gRPC `8085` (plaintext), HTTP `9090` (`/metrics`, pprof only with profiling) |
+| Health | `grpc.health.v1.Health/Check` on `8085`, `NOT_SERVING` until the migrations are done and whenever the database does not answer a ping (every 5 s) |
+| State | Postgres (`orders`, `order_items`) via `DATABASE_URL` |
+| Depends on | its own Postgres (required); Kafka broker (optional, `KAFKA_BROKERS`); OTLP collector and Pyroscope (optional) |
+| Called by | checkout-service (`CreateOrder`, `ConfirmOrder`, `FailOrder`), frontend (`ListOrders`, `GetOrder`, `ClaimOrders`); see `local/compose.yaml` in the workspace |
+| Consumes | topic `orders.placed` (published by checkout-service) |
+| gRPC reflection | enabled |
+
+## Status
+
+No CI pipeline, GitHub repository, Helm chart or Backstage registration exists yet; the service is built and run locally only. Status badges are added when the repo has a pipeline.
+
+## Quick start
+
+In the platform-demo workspace (this repo is built from `apps/order-service` by `local/compose.yaml`; the compose commands were not run for this README):
+
+```bash
+local/up.sh                      # builds all images and starts the shop, http://localhost:8080
+SKIP_BUILD=1 local/up.sh         # reuse images
+local/rebuild.sh order-service   # rebuild and recreate only this service
+```
+
+Run the tests (these were run on 2026-11-13, see Develop):
+
+```bash
+GOTOOLCHAIN=auto go vet ./... && GOTOOLCHAIN=auto go test -race -count=1 ./...
+```
 
 ## API
 
-Package `hipstershop.orders`, service `OrderService` ([`proto/orders.proto`](proto/orders.proto)). The package is a sub-package of `hipstershop` on purpose: `Money` and `Address` are re-declared with exactly the fields and numbers of `hipstershop.Money` / `hipstershop.Address`, and a client that also compiles `demo.proto` would otherwise get two messages with the same full name.
+Package `hipstershop.orders`, service `OrderService` ([`proto/orders.proto`](proto/orders.proto)). Full request/response rules, limits, error mapping and `grpcurl` examples: [`docs/api.md`](docs/api.md).
 
-| Method | Request | Behaviour |
-|---|---|---|
-| `CreateOrder` | `order_id`, `session_id`, optional `user_id`, `email`, `shipping_address`, `items[]` (`product_id`, `name`, `quantity`, `unit_price`, `picture`), optional `shipping_cost`, `total` | Stores the order as `PENDING`. Idempotent by `order_id`: the same content again returns the stored order, other content under the same id is `ALREADY_EXISTS`. The returned `Order` has `created = true` only on the call that inserted the row and `created = false` (present) on the replay (decided by the `INSERT ... ON CONFLICT DO NOTHING` row count, so of N parallel identical calls exactly one gets `true`); the field is `optional bool`, so a client can tell false from unset. `total` must equal `sum(quantity x unit_price) + shipping_cost` exactly and all amounts must share one currency, otherwise `INVALID_ARGUMENT` |
-| `ConfirmOrder` | `order_id`, `shipping_tracking_id`, `payment_transaction_id` | `PENDING` -> `PLACED`, sets the confirmation time. Idempotent with the same two ids; other ids on a placed order or a failed order: `FAILED_PRECONDITION` |
-| `FailOrder` | `order_id`, `reason` | `PENDING` -> `FAILED`. An already failed order is returned unchanged (the first reason stays); a placed order is `FAILED_PRECONDITION` |
-| `GetOrder` | `order_id`, optional `session_id`, optional `user_id` | Returns the order. If a guard is set it must match the order, otherwise `NOT_FOUND` (the same answer as for an unknown id, so ids cannot be probed) |
-| `ListOrders` | exactly one of `session_id` / `user_id`, `page`, `page_size`, `placed_only` | Newest first (`created_at DESC`, id as tie-break). `page` is 1-based, `0` means 1; `page_size` `0` means 10, above 50 is capped. `total` counts all matches. `placed_only` leaves out `PENDING` and `FAILED` orders. Both or neither owner: `INVALID_ARGUMENT` |
-| `ClaimOrders` | `session_id` (1-128), `user_id` (1-128) | Gives the orders of an anonymous session to a user: every order of this `session_id` whose `user_id` is empty gets `user_id` set, whatever its state (`PENDING` and `FAILED` too, it is only an owner field). Orders that already have a user are never touched, so a second user on the same browser cannot take them. Idempotent: repeating returns `claimed = 0`. Returns `{ claimed }`, the number of orders changed by this call. Empty or too long id: `INVALID_ARGUMENT` |
+| Method | Behaviour |
+|---|---|
+| `CreateOrder` | Stores the order as `PENDING`. Idempotent by `order_id` (same content returns the stored order, other content under the same id is `ALREADY_EXISTS`). `total` must equal `sum(quantity x unit_price) + shipping_cost`, one currency, otherwise `INVALID_ARGUMENT` |
+| `ConfirmOrder` | `PENDING` -> `PLACED` with tracking and transaction id. Idempotent with the same ids |
+| `FailOrder` | `PENDING` -> `FAILED` with a reason. A placed order is `FAILED_PRECONDITION` |
+| `GetOrder` | Returns the order; an optional `session_id` / `user_id` guard must match, otherwise `NOT_FOUND` (same as unknown id) |
+| `ListOrders` | Exactly one of `session_id` / `user_id`, paged, newest first, optional `placed_only` |
+| `ClaimOrders` | Gives the unowned orders of a `session_id` to a `user_id`; returns how many changed. Idempotent |
 
-The first five return the `Order` message (`ListOrders`: `{ orders[], total }`; `ClaimOrders` is described in its row). `Order` carries every field of the request plus:
-
-- `status`: `ORDER_STATUS_PENDING | PLACED | PROCESSING | SHIPPED | DELIVERED | FAILED`, computed for the moment of the call.
-- `failure_reason`, `shipping_tracking_id`, `payment_transaction_id`.
-- `created_at`, and for the tracker `placed_at`, `processing_at`, `shipped_at`, `delivered_at`: the moments those stages are reached (`placed_at` plus the configured offsets), also in the future for a stage not reached yet. All four are unset for `PENDING` and `FAILED`. `failed_at` is set for `FAILED`.
-- `evaluated_at`: the server clock the status was computed with. Compare the stage timestamps with this one, not with the browser clock.
-- `created` (field 20, `optional bool`): set only on `CreateOrder` responses, `true` for the call that inserted the order and `false` (explicitly present) on the idempotent replay; unset on every other RPC (`ConfirmOrder`, `FailOrder`, `GetOrder`, `ListOrders`). Checkout uses it to detect that another replica or an earlier attempt already created the order. It is `optional` so that a client can tell "false" from "unset" (an older order-service never sends it: unknown). On the wire it is a normal bool.
-
-Limits: `order_id` 1-64 characters `[A-Za-z0-9._-]` starting with a letter or digit; `session_id` 1-128; `user_id` 0-128 (1-128 in `ClaimOrders`); `email` 3-254, plain address; 1-100 items; `product_id` 1-128, `name` 1-200, `quantity` 1-1000, `picture` 0-500; `street_address` 1-200, `city` 1-100, `state` 0-100, `country` 1-100, `zip_code` >= 0; tracking and transaction ids 1-128; reason 1-500. Text is trimmed, lengths count characters, invalid UTF-8 and NUL are rejected. Money: three upper-case letters, no negative values, `nanos` 0..999,999,999, unit prices and total above zero, units at most 1,000,000,000 (total: 200,000,000,000,000). Item name, unit price and picture are snapshots: the order keeps them if the catalog changes.
-
-Errors: `INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `FAILED_PRECONDITION` as above; `UNAVAILABLE` while the database is not ready or reachable; `INTERNAL` (without SQL details, which are logged) for other storage errors. A recovery interceptor turns a handler panic into `INTERNAL`. Product ids are not checked against the catalog.
-
-Examples (run against the container, see below; note that `grpcurl` prints int64 as strings):
-
-```bash
-grpcurl -plaintext -d '{"order_id":"o-1","session_id":"sess-1","email":"ada@example.com",
-  "shipping_address":{"street_address":"1 Main St","city":"London","country":"UK","zip_code":1234},
-  "items":[{"product_id":"blue-frock-162","name":"Blue Frock","quantity":2,"unit_price":{"currency_code":"USD","units":19,"nanos":990000000}}],
-  "shipping_cost":{"currency_code":"USD","units":4,"nanos":750000000},
-  "total":{"currency_code":"USD","units":44,"nanos":730000000}}' localhost:8085 hipstershop.orders.OrderService/CreateOrder
-grpcurl -plaintext -d '{"order_id":"o-1","shipping_tracking_id":"TRK-1","payment_transaction_id":"TXN-1"}' localhost:8085 hipstershop.orders.OrderService/ConfirmOrder
-grpcurl -plaintext -d '{"order_id":"o-1","session_id":"sess-1"}' localhost:8085 hipstershop.orders.OrderService/GetOrder
-grpcurl -plaintext -d '{"session_id":"sess-1","placed_only":true}' localhost:8085 hipstershop.orders.OrderService/ListOrders
-grpcurl -plaintext -d '{"session_id":"sess-1","user_id":"user-1"}' localhost:8085 hipstershop.orders.OrderService/ClaimOrders
-```
-
-## Status schedule
-
-For an order confirmed at time `T` (`placed_at`) and the current time `now`:
+Status schedule for an order confirmed at `T` (offsets from the configuration table):
 
 | Condition | Shown status |
 |---|---|
-| stored `PENDING` | `PENDING`, never advances |
-| stored `FAILED` | `FAILED`, never advances |
+| stored `PENDING` / `FAILED` | `PENDING` / `FAILED`, never advances |
 | `now < T + ORDER_PROCESSING_AFTER` | `PLACED` |
 | `T + ORDER_PROCESSING_AFTER <= now < T + ORDER_SHIPPED_AFTER` | `PROCESSING` |
 | `T + ORDER_SHIPPED_AFTER <= now < T + ORDER_DELIVERED_AFTER` | `SHIPPED` |
 | `T + ORDER_DELIVERED_AFTER <= now` | `DELIVERED` |
 
-The offsets are all measured from the confirmation (defaults 1m, 3m, 6m). In code the schedule is the pure function `Stages.Schedule(order, now)` and the service takes the clock as a parameter, so the tests run it with a fake clock.
+The schedule is the pure function `Stages.Schedule(order, now)`; the service takes the clock as a parameter.
+
+Events: with `KAFKA_BROKERS` set the service consumes `orders.placed` (key = order id, JSON, schema version 1; the contract is owned by checkout). Behaviour per case and the metrics: [`docs/architecture.md`](docs/architecture.md#kafka-consumer).
 
 ## Configuration
 
-| Variable | Default | Description |
+Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `internal/`, checked 2026-11-13). All configuration is by environment; there is no config file.
+
+| Variable | Default | Required | Meaning |
+|---|---|---|---|
+| `DATABASE_URL` | none | **yes** | Postgres URL, e.g. `postgres://order:order@order-db:5432/orders?sslmode=disable`. The process logs an error and exits 1 if it is unset. A 5 s connect timeout is added unless the URL sets one |
+| `PORT` | `8085` | no | gRPC listen port. The `healthcheck` subcommand reads it too |
+| `METRICS_PORT` | `9090` | no | HTTP port for `/metrics` (and pprof when profiling is on) |
+| `ORDER_PROCESSING_AFTER` | `1m` | no | Offset after confirmation at which `PLACED` becomes `PROCESSING` (Go duration, e.g. `90s`) |
+| `ORDER_SHIPPED_AFTER` | `3m` | no | Offset at which it becomes `SHIPPED` |
+| `ORDER_DELIVERED_AFTER` | `6m` | no | Offset at which it becomes `DELIVERED`. Must satisfy `0 < processing < shipped < delivered`, otherwise the process exits at start-up |
+| `KAFKA_BROKERS` | empty (consumer off) | no | Comma-separated bootstrap servers, e.g. `kafka:9092`. Empty: no consumer, no Kafka metrics registered |
+| `KAFKA_CONSUMER_GROUP` | `order-service` | no | Consumer group of the `orders.placed` consumer. The topic name is a constant (no variable) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | no | OTLP/**gRPC** endpoint URL with scheme for traces, metrics and logs |
+| `OTEL_SDK_DISABLED` | unset | no | `true` forces telemetry off even with an endpoint |
+| `OTEL_SERVICE_NAME` | `order-service` | no | `service.name` resource attribute |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | no | Metric push interval: a number of milliseconds, or a Go duration (`15s`). Invalid values fall back to 15 s |
+| `PYROSCOPE_ADDR` | unset (profiling off) | no | Pyroscope server URL. Profiling (push and pprof endpoints) is on only if this is set |
+| `ENABLE_PROFILING` | unset | no | `0` forces profiling off even with `PYROSCOPE_ADDR` |
+| `ENABLE_TRACING` | unset | no | Legacy: `0` forces telemetry off |
+| `COLLECTOR_SERVICE_ADDR` | unset | no | **Legacy, to be removed** (owner decision 2026-11-13): `host:port` of a collector; turns telemetry on without `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `HOSTNAME` | OS hostname | no | Used as `service.instance.id` (the pod name in Kubernetes) |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | no | Read by the OTel SDK resource detector (`resource.WithFromEnv`), not by this code directly |
+
+The OTLP exporters of the OpenTelemetry Go SDK also read their own standard `OTEL_EXPORTER_OTLP_*` variables (headers, TLS, timeout); they are not read by this service's code and were not tested. `OTEL_TRACES_SAMPLER` is **not** honoured: the sampler is fixed to always-on (`otlp.go`). `LOG_LEVEL` does not exist: the log level is logrus' default (info).
+
+Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background loop runs the goose migrations (under goose's Postgres advisory lock, so replicas starting together apply each migration once), retrying every 2 s until the database is reachable. There is no seed data.
+
+## Observability
+
+What the service emits today (code read 2026-11-13; the compose observability profile was not run for this README):
+
+| Signal | Today | Not there yet (standards section 6) |
 |---|---|---|
-| `DATABASE_URL` | **required** | Postgres URL, e.g. `postgres://order:order@order-db:5432/orders?sslmode=disable`. The process exits if it is unset. A 5 s connect timeout is added unless the URL sets one |
-| `PORT` | `8085` | gRPC listen port |
-| `METRICS_PORT` | `9090` | Prometheus (and, with profiling, pprof) HTTP port |
-| `ORDER_PROCESSING_AFTER` | `1m` | Offset after confirmation at which `PLACED` becomes `PROCESSING` (Go duration: `90s`, `2m`) |
-| `ORDER_SHIPPED_AFTER` | `3m` | Offset at which it becomes `SHIPPED` |
-| `ORDER_DELIVERED_AFTER` | `6m` | Offset at which it becomes `DELIVERED`. Must satisfy `0 < processing < shipped < delivered`, otherwise the process exits at start-up |
-| `KAFKA_BROKERS` | empty (Kafka off) | Comma-separated bootstrap servers, e.g. `kafka:9092`. Empty: the consumer is not started, nothing is registered on `/metrics`, the service behaves exactly as before |
-| `KAFKA_CONSUMER_GROUP` | `order-service` | Consumer group of the `orders.placed` consumer |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | OTLP/**gRPC** endpoint for traces, metrics and logs (scheme required). Legacy fallback: `COLLECTOR_SERVICE_ADDR` (`host:port`). Telemetry is on only if one of them is set and non-empty |
-| `OTEL_SDK_DISABLED` | — | `true` forces telemetry off even with an endpoint (the legacy `ENABLE_TRACING=0` does the same) |
-| `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | Milliseconds between metric pushes |
-| `OTEL_SERVICE_NAME` | `order-service` | `service.name` |
-| `PYROSCOPE_ADDR` | unset (profiling off) | Profiling (Pyroscope push **and** the pprof endpoints on `METRICS_PORT`) is on only if this is set and `ENABLE_PROFILING` is not `0` |
-| `ENABLE_PROFILING` | — | `0` forces profiling off |
+| Traces | OTLP/gRPC, only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. A server span per inbound gRPC call (`otelgrpc`), W3C `traceparent` + `baggage` propagation, sampler always-on | spans for Postgres calls and for the Kafka consumer, trace context from Kafka headers |
+| Metrics | Prometheus on `:9090/metrics`: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics, `order_service_kafka_*` (below). The same registry is pushed over OTLP when the endpoint is set | `build_info`, DB pool stats, business counters |
+| Logs | JSON on stdout, one object per line: `timestamp` (RFC3339Nano), `severity`, `message` plus fields (`order_id`, `topic`, `partition`, `offset` for the consumer). Mirrored over OTLP when the endpoint is set. Card data does not exist here; the Kafka payload (email, address) is never logged | `trace_id` / `span_id` on the stdout line, `service`, `version`, `LOG_LEVEL` |
+| Profiles | Pyroscope push (CPU, alloc objects/space, inuse objects/space) and pprof on the metrics port, only with `PYROSCOPE_ADDR` | goroutine / mutex / block profiles, tags `version`, `environment` |
 
-Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background loop runs the goose migrations (under goose's Postgres session advisory lock, so replicas starting together apply each migration once), retrying every 2 s until the database is reachable. There is no seed data. SIGTERM/SIGINT: health goes `NOT_SERVING`, `GracefulStop` (10 s cap), then the pool is closed and the process exits 0.
+Resource attributes today: `service.name`, `service.instance.id` and the SDK's telemetry attributes (plus whatever `OTEL_RESOURCE_ATTRIBUTES` adds). `service.version`, `service.namespace` and `deployment.environment` are not set.
 
-## Kafka consumer
-
-With `KAFKA_BROKERS` set, the service consumes the topic `orders.placed` (key = order id, JSON value, schema version 1; the contract is owned by checkout, which publishes it) and confirms the order from each event. This is the self-healing path: if checkout published the event but its own `ConfirmOrder` call was lost, the order is still moved from `PENDING` to `PLACED` by the event. The handler goes through the same code as the `ConfirmOrder` RPC (`ValidateConfirm`, then the store transition under a row lock) via `Service.ConfirmFromEvent`; the topic name is a constant, the only settings are the two variables in the table above.
-
-| Case | What happens |
-|---|---|
-| Order `PENDING` | `PENDING -> PLACED` with the event's `shipping_tracking_id` / `payment_transaction_id`; info log |
-| Order already `PLACED` with the same ids (replay, or the RPC got there first) | no-op, counted as processed |
-| Order `PLACED` with different tracking/transaction ids | not applied; error log; skipped |
-| Order `FAILED` | never resurrected; error log `order.placed for a FAILED order order=<id>`; skipped |
-| Unknown order id (event from another environment) | warn log; skipped |
-| Tracking/transaction id empty or too long (breaks the RPC contract) | warn log; skipped |
-| Malformed JSON, wrong field types, empty `order_id`, other `event_type` | warn log with topic/partition/offset; skipped |
-| `schema_version` missing, invalid or not 1 | warn log with topic/partition/offset; skipped (checked before the other fields, so a future schema with changed types lands here) |
-| Unknown JSON fields | ignored |
-| Database down, service not ready, handler timeout (any error that is not one of the cases above) | retried with backoff 0.5 s doubling to 30 s, the same record, **never skipped**; later records wait behind it; the process does not exit |
-
-Delivery is at-least-once, handling is idempotent. Offsets are committed by hand (auto commit is off) after a polled batch has been handled, skipped records included; if a commit fails the records are simply handled again after a restart or rebalance and recognised as replays. A new group starts at the earliest offset. A topic that does not exist yet (or has no leader yet) is waited for: franz-go retries internally and re-reads the topic metadata at least every 15 s, and an `UNKNOWN_TOPIC_OR_PARTITION` that still reaches the consumer is logged at info (`waiting for topic`) and polled again every 2 s, never treated as a failure. The consumer does not poll before the database is migrated and reachable (the same readiness as the gRPC health), and the health check never looks at Kafka: Kafka down or slow changes nothing about SERVING/NOT_SERVING.
-
-Shutdown: on SIGTERM the consumer finishes (and commits) the record it is handling, handles no further record of the batch, leaves the group and closes; one handling attempt is capped at 3 s and the commit at 3 s, and the process waits at most 8 s for it (inside the existing shutdown path, before the pool is closed).
-
-Logs carry `order_id`, `topic`, `partition`, `offset` and never the payload (the event holds the customer's email and address). Metrics on the existing `/metrics`:
+Kafka consumer metrics:
 
 | Metric | Meaning |
 |---|---|
 | `order_service_kafka_events_processed_total{result}` | `confirmed` or `already_placed` |
 | `order_service_kafka_events_skipped_total{reason}` | `malformed`, `unsupported_schema`, `unknown_order`, `failed_order`, `conflict`, `invalid` |
 | `order_service_kafka_events_failed_total` | handling attempts that failed with a transient error |
-| `order_service_kafka_events_retried_total` | retries started after a backoff (differs from `failed` only when shutdown cuts a retry short) |
+| `order_service_kafka_events_retried_total` | retries started after a backoff |
 | `order_service_kafka_offset_commits_total{result}` | `ok` / `error` |
-| `order_service_kafka_consumer_lag{partition}` | high watermark minus the next offset, as of the last handled record of the partition (not updated while a partition is idle or after it moved to another replica) |
+| `order_service_kafka_consumer_lag{partition}` | high watermark minus the next offset, as of the last handled record of the partition |
 
-Client: [franz-go](https://github.com/twmb/franz-go) v1.22.2 (pure Go, no cgo). PLAINTEXT without authentication only (the local demo broker); TLS/SASL options are not wired.
+Example queries (not run against a live backend): `sum by (grpc_method, grpc_code) (rate(grpc_server_handled_total{grpc_service="hipstershop.orders.OrderService"}[5m]))`; Loki `{service_name="order-service"} | json | severity="error"`.
 
-What was run and what was not:
+## Data
 
-- Run (see the commands under "Running locally"): unit tests for event parsing (valid, unknown fields, schema version 0/2/missing/string, malformed, truncated), `ConfirmFromEvent` against the in-memory store (all cases in the table), the handler's outcome mapping and log content, and the consumer loop with a fake record source and fake sleep (batch commit, skips, retry then success in order without skipping, shutdown during a retry, record in flight at shutdown, poll and commit failures). Integration tests (build tag `integration`) against a throwaway single-node `apache/kafka:4.3.2` and `postgres:17-alpine`: `PENDING -> PLACED`, the topic created explicitly after the consumer started (every other test creates its topic with 3 partitions and waits for the leaders before producing; the test producer retries unknown topics without limit), with a one-time wait at the start until the fresh broker can serve consumer groups (its first group request creates and loads `__consumer_offsets`, which took 10 to 60 s on a loaded host and made the first test slow), duplicate / conflicting / FAILED / unknown / malformed / schema-2 records in one partition, restart of the consumer resuming after the committed offset, a transient failure retried and not skipped, the broker unreachable at start and then reachable (through a late-started TCP forwarder), and a `docker restart` of the broker while the consumer runs.
-- Not run: the container image with the consumer, the compose stack end to end with checkout publishing, more than one consumer instance in the same group (rebalancing between two replicas), a multi-broker cluster, TLS/SASL, a poison record that fails with a permanent database error (it would be retried forever by design; the warn log shows the attempt count).
+Postgres, database owned by this service. `orders` (one row per order, stored state `PENDING | PLACED | FAILED`, money as `units` + `nanos`, `fingerprint` = hash of the request for the idempotency check) and `order_items` (one row per line, ordered by `position`). Check constraints repeat the validation limits; `PLACED` requires a confirmation time and both references. Two indexes serve the two `ListOrders` shapes (by session, by user).
 
-## Storage
+Concurrency: `CreateOrder` is `INSERT ... ON CONFLICT DO NOTHING` in one transaction; `ConfirmOrder` / `FailOrder` run under `SELECT ... FOR UPDATE` (a racing confirm and fail: exactly one wins); `ClaimOrders` is one `UPDATE ... WHERE session_id = $1 AND user_id = ''` and returns its row count.
 
-`orders` (one row per order, stored state `PENDING | PLACED | FAILED`, money as `units` + `nanos`, `fingerprint` = hash of the request for the idempotency check) and `order_items` (one row per line, ordered by `position`). Check constraints repeat the validation limits, and `PLACED` requires a confirmation time and both references. Indexes serve the two `ListOrders` shapes (by session, by user). `CreateOrder` is `INSERT ... ON CONFLICT DO NOTHING` in one transaction, `ConfirmOrder`/`FailOrder` run under `SELECT ... FOR UPDATE`, so concurrent calls on one order serialise (a racing confirm and fail: exactly one wins). `ClaimOrders` is ONE statement, `UPDATE orders SET user_id = $2 WHERE session_id = $1 AND user_id = ''`, and returns its row count: a concurrent second claim re-checks the empty `user_id` after the first commits, so two users claiming the same session at once give exactly one winner.
+Migrations: [goose](https://github.com/pressly/goose) SQL files in `internal/orders/migrations/`, embedded in the binary and applied by the service at start-up, forward-only (`00001_create_orders.sql`). No seed data. Demo database in compose: `postgres:17-alpine`, user/password `order` (demo values only, they live in `local/compose.yaml`).
 
-## Container image
+## Develop
 
-Multi-stage [`Dockerfile`](Dockerfile) (same as review-service): `golang:1.26-alpine` builder (`--platform=$BUILDPLATFORM`, `GOARCH=$TARGETARCH`), `alpine:3.24` runtime with the single binary at `/app/order-service`.
+Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker for integration tests, [`grpcurl`](https://github.com/fullstorydev/grpcurl) for manual calls. Layout: `cmd/server/` (entry point, telemetry, health, Kafka start), `internal/orders/` (service, validation, store, migrations), `internal/events/` (Kafka consumer), `proto/`, `tests/integration/`.
 
-- **User:** `10001:10001` (numeric, non-root).
-- **HEALTHCHECK:** `/app/order-service healthcheck` calls the gRPC health service on `127.0.0.1:$PORT` and exits 0 only on `SERVING`.
-- **EXPOSE:** `8085`, `9090`. Built once locally on amd64 (`docker build -t platform-demo/order-service:local .`, about 12 MB); arm64 was not built.
+| Step | Command | Result on 2026-11-13 |
+|---|---|---|
+| Vet + unit tests | `go vet ./... && go test -race -count=1 ./...` | run, passed |
+| Format | `gofmt -l .` | run, no files listed |
+| Lint | `golangci-lint run ./...` (config `.golangci.yaml`, v2 default linters) | run with golangci-lint v2.11.4, 0 issues; also with `--build-tags integration`, 0 issues. CI pins v2.14.0: not run |
+| Integration (Postgres) | see below | not run today (earlier runs by the author are recorded in `docs/development.md`) |
+| Integration (Kafka) | see below | not run today |
+| Vulnerability / security scan | `govulncheck ./...`, `gosec -exclude-generated ./...` | not run today |
+| Image | `docker build -t platform-demo/order-service:local .` | not run today |
+| Docs | `mkdocs build --strict` (needs `mkdocs` + `mkdocs-techdocs-core`) | see `docs/development.md` |
 
-## Used by (local shop)
-
-- **checkout-service** (branch `feat/orders-integration`, env `ORDER_SERVICE_ADDR=order-service:8085`) calls `CreateOrder` before it charges the card, `ConfirmOrder` after shipping and `FailOrder` on any error. With the variable unset checkout does not store orders.
-- **frontend** (env `ORDER_SERVICE_ADDR`, default `order-service:8085`) calls `ListOrders` (`session_id`, `placed_only`) for `/orders` and `GetOrder` (with the session as guard) for `/orders/{id}`, and draws the tracker from the status and the stage timestamps compared with `evaluated_at`.
-- **frontend** also calls `ClaimOrders(session_id = shop_session-id cookie, user_id)` after a login or registration (accounts, slice 5), then lists by `user_id` and guards `GetOrder` with `user_id` while signed in. **checkout-service** sets `CreateOrder.user_id` from the optional `PlaceOrderRequest.account_id` (branch `feat/account-id`), so orders placed while signed in are owned from the start; anonymous orders keep an empty `user_id` until claimed.
-- `session_id` stays on every order (it is the guard for anonymous visitors); claiming only fills `user_id`. This service does not authenticate anybody: the caller (the frontend) decides which `user_id` to claim for.
-
-The local stack (`local/compose.yaml` in the workspace, not in this repository) runs `order-db` (postgres:17-alpine) and `order-service` on port 8085. Run on the live stack: an order placed in the browser is stored as `PLACED` with its tracking id and shows up in the frontend's history and tracking page (first stage seen), declined cards are stored as `FAILED` with the reason. The progression through all four stages is covered by this service's tests (injectable clock) and the frontend's tests with a fake client; the default 1/3/6 minute offsets were not waited through on the live stack.
-
-## Not deployed anywhere yet
-
-No Helm chart, pipeline, Backstage entry or GitHub repository exists; the service is only built and run locally.
-
-## Running locally
-
-Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker, [`grpcurl`](https://github.com/fullstorydev/grpcurl).
-
-What was actually run:
+Integration tests (build tag `integration`, each test creates and drops its own database; Kafka tests skip without `TEST_KAFKA_BROKERS`):
 
 ```bash
-# unit tests (validation, status schedule with a fake clock, state transitions, handlers incl. ClaimOrders, config) + vet
-go vet ./... && go test -race ./...
-
-# integration tests against a throwaway Postgres (each test creates and drops its own database)
 docker run -d --rm --name order-it-pg --memory 256m -e POSTGRES_USER=order -e POSTGRES_PASSWORD=order \
   -p 127.0.0.1:55433:5432 postgres:17-alpine
 TEST_DATABASE_URL='postgres://order:order@127.0.0.1:55433/postgres?sslmode=disable' \
   go test -race -tags integration ./...
-
-# Kafka consumer integration tests: a throwaway single-node broker (~40 s to start) plus the Postgres above
-docker run -d --rm --name order-it-kafka --hostname order-it-kafka --memory 768m -e KAFKA_NODE_ID=1 \
-  -e KAFKA_PROCESS_ROLES=broker,controller -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:19092 -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
-  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
-  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 -e KAFKA_NUM_PARTITIONS=3 -e KAFKA_HEAP_OPTS="-Xms256m -Xmx384m" \
-  -p 127.0.0.1:19092:9092 apache/kafka:4.3.2
-TEST_DATABASE_URL='postgres://order:order@127.0.0.1:55433/postgres?sslmode=disable' \
-TEST_KAFKA_BROKERS=127.0.0.1:19092 TEST_KAFKA_CONTAINER=order-it-kafka \
-  go test -race -count=1 -tags integration ./tests/integration/   # Kafka tests skip without TEST_KAFKA_BROKERS
-
-# container smoke run: image + a Postgres with its own database and user on one docker network
-docker build -t platform-demo/order-service:local .
-docker network create order-smoke
-docker run -d --name order-smoke-db --network order-smoke --network-alias order-db -e POSTGRES_DB=orders -e POSTGRES_USER=order -e POSTGRES_PASSWORD=order postgres:17-alpine
-docker run -d --name order-smoke-svc --network order-smoke -p 127.0.0.1:58085:8085 \
-  -e DATABASE_URL='postgres://order:order@order-db:5432/orders?sslmode=disable' \
-  -e ORDER_PROCESSING_AFTER=5s -e ORDER_SHIPPED_AFTER=10s -e ORDER_DELIVERED_AFTER=15s platform-demo/order-service:local
+docker rm -f order-it-pg
 ```
 
-The Kafka consumer was also run as a plain binary (not the image) against that broker and Postgres: with `KAFKA_BROKERS` set an order created over gRPC and a published `order.placed` ended `PLACED` with the event's tracking id, the five metrics above appeared on `:9090/metrics`, and SIGTERM stopped the process in about 0.1 s with the log line `stopped`; with `KAFKA_BROKERS` empty no Kafka metric exists and the log says the consumer is off; with `KAFKA_BROKERS=127.0.0.1:1` (nothing there) health stayed `SERVING`, the client logged one warning every few seconds and SIGTERM exited 0.
+The Kafka variant (a throwaway single-node `apache/kafka:4.3.2`) is in [`docs/development.md`](docs/development.md).
 
-The smoke run of the image (with the 5/10/15 s offsets) checked: health `SERVING` and Docker health `healthy`; create, repeated create, confirm and the status going `PLACED` -> `PROCESSING` -> `SHIPPED` -> `DELIVERED` while polling `GetOrder`; `NOT_FOUND` for a foreign session; `INVALID_ARGUMENT` for a wrong total and for list with both owners; `ALREADY_EXISTS` for other content under the same id; `FAILED_PRECONDITION` for failing a placed order; `ListOrders` with `placed_only`; health `NOT_SERVING` + `UNAVAILABLE` after disconnecting the database from the network and `SERVING` again after reconnecting it; the order still there after restarting the service container; user `10001`; exit code 0 on `docker stop`.
-`golangci-lint run` (default linters, also with `-tags integration`) and `gosec -exclude-generated ./...` report no issues. `govulncheck` was tried but crashed on the toolchain ("package without types"), so no vulnerability scan was done.
+Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto --go_opt=paths=source_relative --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/orders.proto` (protoc 3.21.12, protoc-gen-go 1.36.11, protoc-gen-go-grpc 1.6.1; not run today). Proto changes are additive only, server first.
 
-Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto --go_opt=paths=source_relative --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/orders.proto` (protoc 3.21.12, protoc-gen-go 1.36.11, protoc-gen-go-grpc 1.6.1).
+## Operate
 
-## Project structure
+- **Health:** `grpc.health.v1` on the service port, empty service name and `hipstershop.orders.OrderService`. `NOT_SERVING` until the migrations are done, and again whenever the Postgres ping fails (checked every 5 s); handlers answer `UNAVAILABLE` meanwhile. Kafka is never part of the health. The image `HEALTHCHECK` runs `/app/order-service healthcheck` (exit 0 only on `SERVING`).
+- **Shutdown:** on SIGTERM/SIGINT health goes `NOT_SERVING`, `GracefulStop` with a 10 s cap (then `Stop`), the metrics server stops (5 s), the Kafka consumer finishes and commits its current record (at most 8 s), telemetry is flushed (5 s), the pool is closed, exit 0.
+- **Scaling:** stateless except for Postgres, so several replicas are possible: migrations are serialised by the advisory lock, Kafka consumers share the group `order-service`. Computed status uses the clock of the replica that answers (see limits). Multi-replica operation was not run.
+- **Image:** Alpine runtime, user `10001:10001`, `EXPOSE 8085 9090`, about 12 MB when last built.
+- Runbook entries and failure behaviour: [`docs/operations.md`](docs/operations.md).
 
-```
-├── cmd/server/
-│   ├── main.go            # entrypoint: telemetry, profiling, gRPC server, DB watcher, graceful shutdown
-│   ├── kafka.go           # starts/stops the orders.placed consumer (KAFKA_BROKERS)
-│   ├── config.go          # ORDER_*_AFTER stage offsets
-│   ├── otlp.go            # OTLP traces/metrics/logs (same as review-service)
-│   └── healthcheck.go     # `order-service healthcheck` for the container HEALTHCHECK
-├── internal/orders/
-│   ├── service.go         # gRPC handlers, error mapping, computed status in the response
-│   ├── validate.go        # request limits, money arithmetic, paging
-│   ├── order.go           # stored states, Confirm/Fail transitions, status Schedule
-│   ├── placed_event.go    # ConfirmFromEvent: ConfirmOrder for the consumer, with an outcome per case
-│   ├── store.go           # Postgres store (pgx/v5)
-│   ├── migrate.go         # goose migrations, Setup
-│   └── migrations/        # embedded SQL migrations
-├── internal/events/       # orders.placed consumer: event parsing, handler, poll/handle/commit loop, franz-go source, metrics
-├── proto/                 # orders.proto + generated Go
-├── tests/integration/     # tests against a real Postgres (build tag `integration`)
-└── Dockerfile
-```
-
-## Known limitations
+## Known limits
 
 - No authentication or rate limiting: anyone who can reach the port can read and create orders, and claim the unowned orders of any session id they know; `session_id` is a guard against mixing orders up, not a credential. Product ids are not checked against the catalog.
-- The computed status uses the clock of the replica that serves the call; replicas with skewed clocks can show a stage a moment early or late (a clock behind the confirmation counts as age zero).
-- `zip_code` is an `int32` to stay compatible with `hipstershop.Address`, so postal codes with letters or leading zeros do not fit.
+- The computed status uses the clock of the replica that serves the call; replicas with skewed clocks can show a stage a moment early or late.
+- `zip_code` is an `int32` to stay compatible with `hipstershop.Address`: postal codes with letters or leading zeros do not fit.
 - Offset paging (page limit 1,000,000); `ListOrders` reads the total and the page in separate statements.
-- Database calls do not produce trace spans (no pgx tracer).
-- The image smoke run predates the Kafka consumer (the image was not rebuilt with it: not run); arm64 was not built.
+- No spans for database calls; no `trace_id` in logs; no version/commit exposed (see Observability).
+- Kafka: PLAINTEXT without authentication only; a permanently failing record is retried forever by design (later records wait behind it).
+- Not run: the image with the Kafka consumer built into it, arm64 build, more than one replica, a multi-broker cluster. The legacy `COLLECTOR_SERVICE_ADDR` is still read (to be removed).
+
+## License
+
+To be decided by the owner. No `LICENSE` file exists in this repository yet.
