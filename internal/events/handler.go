@@ -50,7 +50,7 @@ type ConfirmHandler struct {
 
 // Handle implements Handler.
 func (h *ConfirmHandler) Handle(ctx context.Context, m Meta, ev Event) (Result, error) {
-	l := h.Log.WithFields(logrus.Fields{"order_id": ev.OrderID, "partition": m.Partition, "offset": m.Offset})
+	l := h.Log.WithContext(ctx).WithFields(logrus.Fields{"order_id": ev.OrderID, "partition": m.Partition, "offset": m.Offset})
 	out, err := h.Orders.ConfirmFromEvent(ctx, ev.OrderID, ev.ShippingTrackingID, ev.PaymentTransactionID)
 	if out == orders.OutcomeInvalid {
 		l.Warnf("order.placed has invalid references, skipped: %v", err)

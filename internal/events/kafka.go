@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"order-service/internal/obs"
+
 	"github.com/sirupsen/logrus"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -62,8 +64,12 @@ func (s *kgoSource) Poll(ctx context.Context) ([]Record, error) {
 	var out []Record
 	fetches.EachPartition(func(p kgo.FetchTopicPartition) {
 		for _, r := range p.Records {
+			hs := make([]obs.KafkaHeader, len(r.Headers))
+			for i, h := range r.Headers {
+				hs[i] = obs.KafkaHeader{Key: h.Key, Value: h.Value}
+			}
 			out = append(out, Record{Topic: r.Topic, Partition: r.Partition, Offset: r.Offset, Key: r.Key, Value: r.Value,
-				HighWatermark: p.HighWatermark, raw: r})
+				HighWatermark: p.HighWatermark, Headers: hs, raw: r})
 		}
 	})
 	if len(out) == 0 {

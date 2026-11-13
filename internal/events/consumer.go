@@ -6,7 +6,10 @@ import (
 	"sync"
 	"time"
 
+	"order-service/internal/obs"
+
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Record is one fetched Kafka record. HighWatermark is the partition's end offset when it was fetched.
@@ -17,6 +20,8 @@ type Record struct {
 	Key           []byte
 	Value         []byte
 	HighWatermark int64
+	// Headers are the record headers (traceparent/tracestate of the producer span, OBS-61).
+	Headers []obs.KafkaHeader
 
 	raw any // the client's own record (needed to commit), nil in tests
 }
@@ -48,6 +53,8 @@ type Consumer struct {
 	Handler Handler
 	Log     *logrus.Logger
 	Metrics *Metrics
+	// Group is the consumer group (= service name), an attribute of the CONSUMER span.
+	Group string
 
 	// Backoff is the wait before retry number n (1, 2, ...) of one record, or before polling again after n failed
 	// polls in a row. Default: 0.5 s doubling up to 30 s.
@@ -165,8 +172,16 @@ func (c *Consumer) commit(ctx context.Context, handled []Record) {
 // handleRecord returns true when the record is done (applied or deliberately skipped) and false when ctx ended
 // while it was still failing.
 func (c *Consumer) handleRecord(ctx context.Context, rec Record) bool {
+	// CONSUMER span: a child of the producer span when the record carries a valid traceparent
+	// (one order = one trace), else a new root. Bad headers never break consumption.
+	ctx, span := obs.ConsumerSpan(ctx, c.Group, rec.Topic, rec.Partition, rec.Offset, rec.Headers)
+	defer span.End()
+	return c.handle(ctx, rec)
+}
+
+func (c *Consumer) handle(ctx context.Context, rec Record) bool {
 	meta := Meta{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-	l := c.Log.WithFields(logrus.Fields{"topic": rec.Topic, "partition": rec.Partition, "offset": rec.Offset})
+	l := c.Log.WithContext(ctx).WithFields(logrus.Fields{"topic": rec.Topic, "partition": rec.Partition, "offset": rec.Offset})
 	ev, err := Parse(rec.Value)
 	if err != nil {
 		reason := "malformed"
@@ -174,7 +189,8 @@ func (c *Consumer) handleRecord(ctx context.Context, rec Record) bool {
 			reason = "unsupported_schema"
 		}
 		c.Metrics.skipped.WithLabelValues(reason).Inc()
-		l.Warnf("skipping record: %v", err) // the error has no payload in it
+		trace.SpanFromContext(ctx).RecordError(err)
+		l.WithError(err).Warn("skipping record") // the error has no payload in it
 		return true
 	}
 	l = l.WithField("order_id", ev.OrderID)
@@ -197,7 +213,8 @@ func (c *Consumer) handleRecord(ctx context.Context, rec Record) bool {
 			return true
 		}
 		c.Metrics.failed.Inc()
-		l.Warnf("handling failed (attempt %d), will retry: %v", attempt+1, err)
+		trace.SpanFromContext(ctx).RecordError(err)
+		l.WithError(err).Warnf("handling failed (attempt %d), will retry", attempt+1)
 		if ctx.Err() != nil {
 			return false
 		}

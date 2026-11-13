@@ -29,6 +29,7 @@ func startKafka(ctx context.Context, svc *orders.Service) (stop func()) {
 		Source:  &gatedSource{Source: src, ready: svc.Ready},
 		Handler: &events.ConfirmHandler{Orders: svc, Log: log},
 		Log:     log,
+		Group:   cfg.Group,
 		Metrics: events.NewMetrics(prometheus.DefaultRegisterer),
 	}
 	g := events.Start(ctx, c)
