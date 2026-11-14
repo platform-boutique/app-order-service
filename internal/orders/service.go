@@ -49,7 +49,7 @@ func (s *Service) checkReady() error {
 func (s *Service) clock() time.Time { return s.now().UTC().Truncate(time.Microsecond) }
 
 // toStatus maps internal errors to gRPC status codes without leaking SQL details to the caller.
-func (s *Service) toStatus(method string, err error) error {
+func (s *Service) toStatus(ctx context.Context, method string, err error) error {
 	switch {
 	case errors.Is(err, ErrInvalid):
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -64,10 +64,10 @@ func (s *Service) toStatus(method string, err error) error {
 	case errors.Is(err, context.DeadlineExceeded):
 		return status.Error(codes.DeadlineExceeded, "deadline exceeded")
 	case errors.Is(err, ErrUnavailable):
-		s.log.Warnf("[%s] database unavailable: %v", method, err)
+		s.log.WithContext(ctx).Warnf("[%s] database unavailable: %v", method, err)
 		return status.Error(codes.Unavailable, "database unavailable")
 	default:
-		s.log.Errorf("[%s] storage error: %v", method, err)
+		s.log.WithContext(ctx).Errorf("[%s] storage error: %v", method, err)
 		return status.Error(codes.Internal, "internal error")
 	}
 }
@@ -138,7 +138,7 @@ func clampInt32(v int64) int32 {
 func (s *Service) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.Order, error) {
 	n, err := ValidateNewOrder(req)
 	if err != nil {
-		return nil, s.toStatus("CreateOrder", err)
+		return nil, s.toStatus(ctx, "CreateOrder", err)
 	}
 	if err := s.checkReady(); err != nil {
 		return nil, err
@@ -146,9 +146,9 @@ func (s *Service) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (
 	now := s.clock()
 	o, created, err := s.store.Create(ctx, n, now)
 	if err != nil {
-		return nil, s.toStatus("CreateOrder", err)
+		return nil, s.toStatus(ctx, "CreateOrder", err)
 	}
-	s.log.WithFields(logrus.Fields{"order_id": o.ID, "items": len(o.Items), "created": created}).Info("[CreateOrder] order stored")
+	s.log.WithContext(ctx).WithFields(logrus.Fields{"order_id": o.ID, "items": len(o.Items), "created": created}).Info("[CreateOrder] order stored")
 	out := s.toPB(o, now)
 	// created comes from the INSERT itself (Store.Create), so of two parallel identical calls exactly one gets true.
 	out.Created = &created
@@ -159,7 +159,7 @@ func (s *Service) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (
 func (s *Service) ConfirmOrder(ctx context.Context, req *pb.ConfirmOrderRequest) (*pb.Order, error) {
 	id, tracking, txn, err := ValidateConfirm(req)
 	if err != nil {
-		return nil, s.toStatus("ConfirmOrder", err)
+		return nil, s.toStatus(ctx, "ConfirmOrder", err)
 	}
 	if err := s.checkReady(); err != nil {
 		return nil, err
@@ -167,9 +167,9 @@ func (s *Service) ConfirmOrder(ctx context.Context, req *pb.ConfirmOrderRequest)
 	now := s.clock()
 	o, err := s.store.Confirm(ctx, id, tracking, txn, now)
 	if err != nil {
-		return nil, s.toStatus("ConfirmOrder", err)
+		return nil, s.toStatus(ctx, "ConfirmOrder", err)
 	}
-	s.log.WithFields(logrus.Fields{"order_id": o.ID}).Info("[ConfirmOrder] order placed")
+	s.log.WithContext(ctx).WithFields(logrus.Fields{"order_id": o.ID}).Info("[ConfirmOrder] order placed")
 	return s.toPB(o, now), nil
 }
 
@@ -177,7 +177,7 @@ func (s *Service) ConfirmOrder(ctx context.Context, req *pb.ConfirmOrderRequest)
 func (s *Service) FailOrder(ctx context.Context, req *pb.FailOrderRequest) (*pb.Order, error) {
 	id, reason, err := ValidateFail(req)
 	if err != nil {
-		return nil, s.toStatus("FailOrder", err)
+		return nil, s.toStatus(ctx, "FailOrder", err)
 	}
 	if err := s.checkReady(); err != nil {
 		return nil, err
@@ -185,9 +185,9 @@ func (s *Service) FailOrder(ctx context.Context, req *pb.FailOrderRequest) (*pb.
 	now := s.clock()
 	o, err := s.store.Fail(ctx, id, reason, now)
 	if err != nil {
-		return nil, s.toStatus("FailOrder", err)
+		return nil, s.toStatus(ctx, "FailOrder", err)
 	}
-	s.log.WithFields(logrus.Fields{"order_id": o.ID}).Info("[FailOrder] order failed")
+	s.log.WithContext(ctx).WithFields(logrus.Fields{"order_id": o.ID}).Info("[FailOrder] order failed")
 	return s.toPB(o, now), nil
 }
 
@@ -195,17 +195,17 @@ func (s *Service) FailOrder(ctx context.Context, req *pb.FailOrderRequest) (*pb.
 func (s *Service) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.Order, error) {
 	id, sessionGuard, userGuard, err := ValidateGet(req)
 	if err != nil {
-		return nil, s.toStatus("GetOrder", err)
+		return nil, s.toStatus(ctx, "GetOrder", err)
 	}
 	if err := s.checkReady(); err != nil {
 		return nil, err
 	}
 	o, err := s.store.Get(ctx, id)
 	if err != nil {
-		return nil, s.toStatus("GetOrder", err)
+		return nil, s.toStatus(ctx, "GetOrder", err)
 	}
 	if (sessionGuard != "" && sessionGuard != o.SessionID) || (userGuard != "" && userGuard != o.UserID) {
-		return nil, s.toStatus("GetOrder", ErrNotFound)
+		return nil, s.toStatus(ctx, "GetOrder", ErrNotFound)
 	}
 	return s.toPB(o, s.clock()), nil
 }
@@ -214,14 +214,14 @@ func (s *Service) GetOrder(ctx context.Context, req *pb.GetOrderRequest) (*pb.Or
 func (s *Service) ListOrders(ctx context.Context, req *pb.ListOrdersRequest) (*pb.ListOrdersResponse, error) {
 	f, limit, offset, err := ValidateList(req)
 	if err != nil {
-		return nil, s.toStatus("ListOrders", err)
+		return nil, s.toStatus(ctx, "ListOrders", err)
 	}
 	if err := s.checkReady(); err != nil {
 		return nil, err
 	}
 	page, total, err := s.store.List(ctx, f, limit, offset)
 	if err != nil {
-		return nil, s.toStatus("ListOrders", err)
+		return nil, s.toStatus(ctx, "ListOrders", err)
 	}
 	now := s.clock()
 	resp := &pb.ListOrdersResponse{Orders: make([]*pb.Order, 0, len(page)), Total: clampInt32(total)}
@@ -236,16 +236,16 @@ func (s *Service) ListOrders(ctx context.Context, req *pb.ListOrdersRequest) (*p
 func (s *Service) ClaimOrders(ctx context.Context, req *pb.ClaimOrdersRequest) (*pb.ClaimOrdersResponse, error) {
 	sessionID, userID, err := ValidateClaim(req)
 	if err != nil {
-		return nil, s.toStatus("ClaimOrders", err)
+		return nil, s.toStatus(ctx, "ClaimOrders", err)
 	}
 	if err := s.checkReady(); err != nil {
 		return nil, err
 	}
 	n, err := s.store.Claim(ctx, sessionID, userID)
 	if err != nil {
-		return nil, s.toStatus("ClaimOrders", err)
+		return nil, s.toStatus(ctx, "ClaimOrders", err)
 	}
 	// only the count is logged: the session id is a browser cookie value and stays out of the logs
-	s.log.WithFields(logrus.Fields{"claimed": n}).Info("[ClaimOrders] orders claimed")
+	s.log.WithContext(ctx).WithFields(logrus.Fields{"claimed": n}).Info("[ClaimOrders] orders claimed")
 	return &pb.ClaimOrdersResponse{Claimed: clampInt32(n)}, nil
 }

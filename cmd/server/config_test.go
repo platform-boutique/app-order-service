@@ -1,82 +1,98 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
+	"order-service/internal/obs"
 	"order-service/internal/orders"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
 )
 
-func clearTelemetryEnv(t *testing.T) {
-	for _, k := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "COLLECTOR_SERVICE_ADDR", "OTEL_SDK_DISABLED", "ENABLE_TRACING", "PYROSCOPE_ADDR", "ENABLE_PROFILING"} {
-		t.Setenv(k, "")
-	}
-}
+func env(m map[string]string) obs.Getenv { return func(k string) string { return m[k] } }
 
-func TestTelemetryOffByDefault(t *testing.T) {
-	clearTelemetryEnv(t)
-	if ep := otlpEndpoint(); ep != "" {
-		t.Fatalf("endpoint %q with everything unset", ep)
-	}
-	shutdown, err := initTelemetry(context.Background(), serviceName, log)
-	if !errors.Is(err, errTelemetryOff) {
-		t.Fatalf("initTelemetry err = %v, want errTelemetryOff", err)
-	}
-	if err := shutdown(context.Background()); err != nil {
-		t.Fatalf("no-op shutdown: %v", err)
-	}
-	if _, on := profilingConfig(); on {
-		t.Fatal("profiling on with everything unset")
-	}
-}
-
-func TestTelemetrySwitches(t *testing.T) {
+// TestEnvContract is order-service's view of the telemetry contract (OBS-01, OBS-04). The full matrix is in
+// internal/obs/env_test.go; this table pins what main.go relies on: the names read, and the legacy ones that are not.
+func TestEnvContract(t *testing.T) {
 	cases := []struct {
-		name string
-		env  map[string]string
-		want string
+		name      string
+		env       map[string]string
+		telemetry string // expected OTLP endpoint, "" = off
+		profiling string // expected Pyroscope address, "" = off
 	}{
-		{"endpoint", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317"}, "http://alloy:4317"},
-		{"blank endpoint", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "  "}, ""},
-		{"legacy addr", map[string]string{"COLLECTOR_SERVICE_ADDR": "alloy:4317"}, "http://alloy:4317"},
-		{"sdk disabled", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "OTEL_SDK_DISABLED": "true"}, ""},
-		{"sdk disabled upper", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "OTEL_SDK_DISABLED": "TRUE"}, ""},
-		{"sdk disabled false", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "OTEL_SDK_DISABLED": "false"}, "http://alloy:4317"},
-		{"enable_tracing 0", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "ENABLE_TRACING": "0"}, ""},
+		{"nothing set", nil, "", ""},
+		{"endpoint", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317"}, "http://alloy:4317", ""},
+		{"blank endpoint", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "  "}, "", ""},
+		{"endpoint without scheme is off, not a crash", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "alloy:4317"}, "", ""},
+		{"legacy COLLECTOR_SERVICE_ADDR is ignored", map[string]string{"COLLECTOR_SERVICE_ADDR": "alloy:4317"}, "", ""},
+		{"legacy ENABLE_TRACING=0 is no longer read", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "ENABLE_TRACING": "0"}, "http://alloy:4317", ""},
+		{"sdk disabled", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "OTEL_SDK_DISABLED": "true", "PYROSCOPE_ADDR": "http://pyroscope:4040"}, "", ""},
+		{"sdk disabled, upper case and padded", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "OTEL_SDK_DISABLED": " TRUE "}, "", ""},
+		{"sdk disabled=false", map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "http://alloy:4317", "OTEL_SDK_DISABLED": "false"}, "http://alloy:4317", ""},
+		{"ENABLE_PROFILING=1 alone starts nothing", map[string]string{"ENABLE_PROFILING": "1"}, "", ""},
+		{"pyroscope", map[string]string{"PYROSCOPE_ADDR": "http://pyroscope:4040"}, "", "http://pyroscope:4040"},
+		{"pyroscope, ENABLE_PROFILING=1", map[string]string{"PYROSCOPE_ADDR": "http://pyroscope:4040", "ENABLE_PROFILING": "1"}, "", "http://pyroscope:4040"},
+		{"pyroscope, ENABLE_PROFILING=0", map[string]string{"PYROSCOPE_ADDR": "http://pyroscope:4040", "ENABLE_PROFILING": "0"}, "", ""},
+		{"pyroscope without scheme", map[string]string{"PYROSCOPE_ADDR": "pyroscope:4040"}, "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			clearTelemetryEnv(t)
-			for k, v := range c.env {
-				t.Setenv(k, v)
+			s := obs.LoadSettings(serviceName, env(c.env))
+			if s.OTLPEndpoint != c.telemetry || s.TelemetryOn() != (c.telemetry != "") {
+				t.Errorf("telemetry endpoint = %q (on=%v), want %q", s.OTLPEndpoint, s.TelemetryOn(), c.telemetry)
 			}
-			if got := otlpEndpoint(); got != c.want {
-				t.Errorf("otlpEndpoint() = %q, want %q", got, c.want)
+			if s.PyroscopeAddr != c.profiling || s.ProfilingOn() != (c.profiling != "") {
+				t.Errorf("profiling addr = %q (on=%v), want %q", s.PyroscopeAddr, s.ProfilingOn(), c.profiling)
 			}
 		})
 	}
 }
 
-func TestProfilingSwitch(t *testing.T) {
-	cases := []struct {
-		addr, enable string
-		on           bool
-	}{
-		{"", "", false},
-		{"", "1", false},
-		{"http://alloy:4040", "", true},
-		{"http://alloy:4040", "1", true},
-		{"http://alloy:4040", "0", false},
+func TestEnvDefaultsAndResource(t *testing.T) {
+	s := obs.LoadSettings(serviceName, env(map[string]string{"HOSTNAME": "order-0"}))
+	if s.Service != "order-service" || s.Environment != "local" || s.Instance != "order-0" || s.MetricsAddr != ":9090" || s.PprofAddr != "" {
+		t.Fatalf("defaults: %+v", s)
 	}
-	for _, c := range cases {
-		clearTelemetryEnv(t)
-		t.Setenv("PYROSCOPE_ADDR", c.addr)
-		t.Setenv("ENABLE_PROFILING", c.enable)
-		if addr, on := profilingConfig(); on != c.on || (on && addr != c.addr) {
-			t.Errorf("PYROSCOPE_ADDR=%q ENABLE_PROFILING=%q: on=%v addr=%q, want on=%v", c.addr, c.enable, on, addr, c.on)
-		}
+	s = obs.LoadSettings(serviceName, env(map[string]string{"DEPLOYMENT_ENVIRONMENT": "dev", "METRICS_PORT": "9191", "PPROF_ADDR": "127.0.0.1:6060", "SERVICE_VERSION": "1.2.3"}))
+	if s.Environment != "dev" || s.MetricsAddr != ":9191" || s.PprofAddr != "127.0.0.1:6060" || s.Version != "1.2.3" {
+		t.Fatalf("overrides: %+v", s)
+	}
+}
+
+// TestStartWiringLogsTheContractShape starts the kit the way main does (same options, no listener) and checks the
+// first line is the JSON "starting" line with the service name, and that a handler-style call carries trace ids.
+func TestStartWiringLogsTheContractShape(t *testing.T) {
+	for _, k := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_SDK_DISABLED", "PYROSCOPE_ADDR", "ENABLE_PROFILING", "LOG_LEVEL"} {
+		t.Setenv(k, "")
+	}
+	var out bytes.Buffer
+	l := logrus.New()
+	x := obs.Start(context.Background(), obs.Options{
+		Service: serviceName, Loggers: []*logrus.Logger{l}, Out: &out, NoMetricsServer: true,
+		Registerer: prometheus.NewRegistry(), Gatherer: prometheus.NewRegistry(),
+	})
+	defer x.Shutdown()
+
+	l.WithContext(obs.WithRequestID(context.Background(), "req-1")).Info("no span here")
+	var first, second map[string]any
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first line is not JSON: %v: %s", err, lines[0])
+	}
+	if first["message"] != "starting" || first["service"] != serviceName || first["severity"] != "info" || first["version"] == nil || first["commit"] == nil {
+		t.Fatalf("starting line: %v", first)
+	}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &second); err != nil {
+		t.Fatalf("last line is not JSON: %v", err)
+	}
+	if second["request_id"] != "req-1" || second["trace_id"] != nil || second["span_id"] != nil {
+		t.Fatalf("outside a span the ids must be absent: %v", second)
 	}
 }
 
