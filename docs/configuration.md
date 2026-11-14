@@ -10,7 +10,9 @@ Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `in
 | `ORDER_SHIPPED_AFTER` | `3m` | no | Offset at which it becomes `SHIPPED` |
 | `ORDER_DELIVERED_AFTER` | `6m` | no | Offset at which it becomes `DELIVERED`. Must satisfy `0 < processing < shipped < delivered`, otherwise the process exits at start-up |
 | `KAFKA_BROKERS` | empty (consumer off) | no | Comma-separated bootstrap servers, e.g. `kafka:9092`. Empty: no consumer, no Kafka metrics registered |
-| `KAFKA_CONSUMER_GROUP` | `order-service` | no | Consumer group of the `orders.placed` consumer. The topic name is a constant (no variable) |
+| `KAFKA_CONSUMER_GROUP` | `order-service` | no | Consumer group of the `orders.placed` consumer (never prefixed) |
+| `KAFKA_TOPIC_PREFIX` | empty | no | Put in front of the topic name, `dev.` gives `dev.orders.placed`, so several environments can share one cluster. Letters, digits, `.`, `_`, `-` only; anything else stops the start with an error. Checkout must publish to the same prefixed name. The consumer creates the topic when it is missing (broker default partitions and replication) |
+| `REQUEST_TIMEOUT` | `5s` | no | Server-side bound of every unary call (Go duration, at least `100ms`; `0` switches the bound off). A call without a deadline gets this one, a longer caller deadline is shortened to it; the context reaches every database query. A value that does not parse keeps `5s` with a warning |
 | `HOSTNAME` | OS hostname | no | Used as `service.instance.id` (the pod name in Kubernetes) |
 | `METRICS_PORT` | `9090` | no | Port of the Prometheus `/metrics` endpoint (scraped by Alloy). A value that is not a port falls back to `9090` with a warning |
 | `PPROF_ADDR` | unset (no pprof) | no | `host:port` of a separate pprof listener, e.g. `127.0.0.1:6060`. Off unless set; never expose it. pprof is never served on the metrics port |

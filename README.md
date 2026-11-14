@@ -77,7 +77,9 @@ Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `in
 | `ORDER_SHIPPED_AFTER` | `3m` | no | Offset at which it becomes `SHIPPED` |
 | `ORDER_DELIVERED_AFTER` | `6m` | no | Offset at which it becomes `DELIVERED`. Must satisfy `0 < processing < shipped < delivered`, otherwise the process exits at start-up |
 | `KAFKA_BROKERS` | empty (consumer off) | no | Comma-separated bootstrap servers, e.g. `kafka:9092`. Empty: no consumer, no Kafka metrics registered |
-| `KAFKA_CONSUMER_GROUP` | `order-service` | no | Consumer group of the `orders.placed` consumer. The topic name is a constant (no variable) |
+| `KAFKA_CONSUMER_GROUP` | `order-service` | no | Consumer group of the `orders.placed` consumer (never prefixed) |
+| `KAFKA_TOPIC_PREFIX` | empty | no | Put in front of the topic name, `dev.` gives `dev.orders.placed`, so several environments can share one cluster. Letters, digits, `.`, `_`, `-` only; anything else stops the start with an error. Checkout must publish to the same prefixed name. The consumer creates the topic when it is missing (broker default partitions and replication) |
+| `REQUEST_TIMEOUT` | `5s` | no | Server-side bound of every unary call (Go duration, at least `100ms`; `0` switches the bound off). A call without a deadline gets this one, a longer caller deadline is shortened to it; the context reaches every database query. A value that does not parse keeps `5s` with a warning |
 | `HOSTNAME` | OS hostname | no | Used as `service.instance.id` (the pod name in Kubernetes) |
 | `METRICS_PORT` | `9090` | no | Port of the Prometheus `/metrics` endpoint (scraped by Alloy). A value that is not a port falls back to `9090` with a warning |
 | `PPROF_ADDR` | unset (no pprof) | no | `host:port` of a separate pprof listener, e.g. `127.0.0.1:6060`. Off unless set; never expose it. pprof is never served on the metrics port |
@@ -170,7 +172,7 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 ## Operate
 
 - **Health:** `grpc.health.v1` on the service port, empty service name and `hipstershop.orders.OrderService`. `NOT_SERVING` until the migrations are done, and again whenever the Postgres ping fails (checked every 5 s); handlers answer `UNAVAILABLE` meanwhile. Kafka is never part of the health. The image `HEALTHCHECK` runs `/app/order-service healthcheck` (exit 0 only on `SERVING`).
-- **Shutdown:** on SIGTERM/SIGINT health goes `NOT_SERVING`, `GracefulStop` with a 10 s cap (then `Stop`), the Kafka consumer finishes and commits its current record (at most 8 s), the pool is closed, then telemetry and profiles are flushed and the metrics server stops (together capped at 4 s, so a blackholed collector cannot hold the process), exit 0.
+- **Shutdown:** on SIGTERM/SIGINT health goes `NOT_SERVING`; `GracefulStop` and the Kafka consumer (finish and commit the current record, leave the group) run in parallel for at most 5 s (then `Stop`); the pool is closed (at most 1 s); telemetry and profiles are flushed and the metrics server stops (at most 3 s, so a blackholed collector cannot hold the process); exit 0. At most 9 s in total inside the 10 s of CODE-04, and a watchdog ends the process with exit 1 at 10 s if something else hangs.
 - **Scaling:** stateless except for Postgres, so several replicas are possible: migrations are serialised by the advisory lock, Kafka consumers share the group `order-service`. Computed status uses the clock of the replica that answers (see limits). Multi-replica operation was not run.
 - **Image:** Alpine runtime, user `10001:10001`, `EXPOSE 8085 9090`, about 12 MB when last built.
 - Runbook entries and failure behaviour: [`docs/operations.md`](docs/operations.md).

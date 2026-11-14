@@ -12,18 +12,22 @@ import (
 )
 
 // startKafka starts the orders.placed consumer when KAFKA_BROKERS is set and returns the function that stops it
-// (finish the current record, commit, leave the group; at most 8 s). With KAFKA_BROKERS empty it does nothing and the
-// returned function is a no-op. A consumer problem never stops the gRPC server or its health.
-func startKafka(ctx context.Context, svc *orders.Service) (stop func()) {
+// (finish the current record, commit, leave the group; at most the given time, false = it did not finish). With
+// KAFKA_BROKERS empty it does nothing and the returned function is a no-op. An invalid KAFKA_TOPIC_PREFIX is an error
+// (the service does not start). A consumer problem later never stops the gRPC server or its health.
+func startKafka(ctx context.Context, svc *orders.Service) (stop func(time.Duration) bool, err error) {
 	cfg := events.ConfigFromEnv(os.Getenv)
 	if !cfg.Enabled() {
 		log.Info("kafka consumer off — set KAFKA_BROKERS to enable")
-		return func() {}
+		return func(time.Duration) bool { return true }, nil
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	src, err := events.NewKafkaSource(cfg, log)
 	if err != nil {
 		log.Errorf("kafka consumer NOT started: %v", err)
-		return func() {}
+		return func(time.Duration) bool { return true }, nil
 	}
 	c := &events.Consumer{
 		Source:  &gatedSource{Source: src, ready: svc.Ready},
@@ -33,12 +37,8 @@ func startKafka(ctx context.Context, svc *orders.Service) (stop func()) {
 		Metrics: events.NewMetrics(prometheus.DefaultRegisterer),
 	}
 	g := events.Start(ctx, c)
-	log.Infof("kafka consumer started: topic %s, group %s, %d broker(s)", events.Topic, cfg.Group, len(cfg.Brokers))
-	return func() {
-		if !g.Stop(8 * time.Second) {
-			log.Warn("kafka consumer did not stop in time")
-		}
-	}
+	log.Infof("kafka consumer started: topic %s, group %s, %d broker(s); the topic is created if missing", cfg.Topic, cfg.Group, len(cfg.Brokers))
+	return g.Stop, nil
 }
 
 // gatedSource does not poll before the service is ready (database migrated), so records are not fetched just to

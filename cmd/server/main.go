@@ -17,6 +17,7 @@ import (
 
 	grpcprom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -46,7 +47,7 @@ func main() {
 
 	// Env contract (OTEL_*, PYROSCOPE_ADDR), JSON logs, OTLP pipelines, Pyroscope, build_info, /metrics on
 	// :9090 (METRICS_PORT) and pprof only with PPROF_ADDR all live in internal/obs.
-	o := obs.Start(context.Background(), obs.Options{Service: serviceName, Loggers: []*logrus.Logger{log}})
+	o := obs.Start(context.Background(), obs.Options{Service: serviceName, Loggers: []*logrus.Logger{log}, ShutdownTimeout: obsFlushBudget})
 	defer o.Recover()
 	defer o.Shutdown()
 
@@ -75,11 +76,20 @@ func run(port, dsn string) error {
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = 5 * time.Second
 	}
+	obs.InstrumentPool(cfg, nil)                                  // database client spans (children of the request or consumer span)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg) // lazy: does not connect yet
 	if err != nil {
 		return fmt.Errorf("database pool: %w", err)
 	}
+	// closed by the shutdown steps, after the consumer and the gRPC calls are done; this defer covers early returns
 	defer pool.Close()
+	if err := obs.RegisterPoolMetrics(prometheus.DefaultRegisterer, pool); err != nil {
+		log.WithError(err).Warn("database pool metrics not registered")
+	}
+	requestTimeout, badTimeout := obs.RequestTimeoutFromEnv(os.Getenv)
+	if badTimeout != "" {
+		log.Warnf("REQUEST_TIMEOUT=%q is not a duration of at least 100ms (or 0), using %s", badTimeout, requestTimeout)
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
@@ -89,7 +99,7 @@ func run(port, dsn string) error {
 	// gRPC server with OTel tracing + Prometheus metrics interceptors, plus a panic guard
 	srv := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.ChainUnaryInterceptor(obs.UnaryServerInterceptor(), grpcprom.UnaryServerInterceptor, recoverUnary),
+		grpc.ChainUnaryInterceptor(obs.UnaryServerInterceptor(), obs.DeadlineUnaryInterceptor(requestTimeout), grpcprom.UnaryServerInterceptor, recoverUnary),
 		grpc.ChainStreamInterceptor(obs.StreamServerInterceptor(), grpcprom.StreamServerInterceptor),
 	)
 
@@ -112,7 +122,11 @@ func run(port, dsn string) error {
 	go watchDatabase(ctx, pool, store, svc, healthSrv)
 
 	// --- Kafka: orders.placed consumer (self-healing confirm), only with KAFKA_BROKERS set; stopped before the pool closes ---
-	defer startKafka(ctx, svc)()
+	stopKafka, err := startKafka(ctx, svc)
+	if err != nil {
+		return err
+	}
+	defer stopKafka(drainBudget)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -127,15 +141,16 @@ func run(port, dsn string) error {
 	}
 
 	log.Info("shutdown signal received, draining")
+	watchdog(time.After, os.Exit, log)
 	healthSrv.Shutdown() // NOT_SERVING for every service, so probes fail first
-	done := make(chan struct{})
-	go func() { srv.GracefulStop(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		log.Warn("graceful stop timed out, closing remaining connections")
-		srv.Stop()
-	}
+	(&shutdownSteps{
+		GracefulStop: srv.GracefulStop,
+		ForceStop:    srv.Stop,
+		StopConsumer: stopKafka,
+		ClosePool:    pool.Close,
+		After:        time.After,
+		Log:          log,
+	}).run()
 	return nil
 }
 
