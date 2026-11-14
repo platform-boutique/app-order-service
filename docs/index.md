@@ -10,7 +10,7 @@ A gRPC service that stores the orders of the Everly shop and reports their track
 | | |
 |---|---|
 | Runtime | Go 1.26, static binary, image `platform-demo/order-service:local` (built locally only) |
-| Ports | gRPC `8085`, HTTP `9090` (`/metrics`) |
+| Ports | gRPC `8085`, HTTP `9090` (`/metrics`; pprof only on `PPROF_ADDR`) |
 | State | its own Postgres (`orders`, `order_items`) |
 | Called by | checkout-service, frontend |
 | Status | not deployed anywhere yet; no pipeline, no Helm chart |

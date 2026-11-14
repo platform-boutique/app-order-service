@@ -17,9 +17,9 @@ SIGTERM or SIGINT:
 
 1. health goes `NOT_SERVING` so probes fail first;
 2. `GracefulStop` with a 10 s cap, then `Stop`;
-3. the metrics server is shut down (5 s);
-4. the Kafka consumer finishes and commits the record it is handling, handles no further record, leaves the group (at most 8 s);
-5. telemetry is flushed (5 s), the pool is closed, exit 0.
+3. the Kafka consumer finishes and commits the record it is handling, handles no further record, leaves the group (at most 8 s);
+4. the pool is closed;
+5. telemetry and profiles are flushed and the metrics server is shut down, together capped at 4 s (`obs.DefaultShutdownTimeout`), exit 0.
 
 Measured earlier by the author: `docker stop` exit code 0 (image smoke run), plain-binary SIGTERM about 0.1 s with the consumer. Not re-measured with a blackholed OTLP endpoint.
 

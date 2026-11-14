@@ -10,7 +10,7 @@ Context diagram and the main flow as sequence diagram: [`docs/architecture.md`](
 |---|---|
 | Language / runtime | Go 1.26 (`go.mod`: `go 1.26.0`, `toolchain go1.26.10`), static binary, `CGO_ENABLED=0` |
 | Image | built locally only: `platform-demo/order-service:local` (`Dockerfile`, user `10001:10001`) |
-| Ports | gRPC `8085` (plaintext), HTTP `9090` (`/metrics`, pprof only with profiling) |
+| Ports | gRPC `8085` (plaintext), HTTP `9090` (`/metrics`; pprof only on a separate `PPROF_ADDR`) |
 | Health | `grpc.health.v1.Health/Check` on `8085`, `NOT_SERVING` until the migrations are done and whenever the database does not answer a ping (every 5 s) |
 | State | Postgres (`orders`, `order_items`) via `DATABASE_URL` |
 | Depends on | its own Postgres (required); Kafka broker (optional, `KAFKA_BROKERS`); OTLP collector and Pyroscope (optional) |
@@ -73,39 +73,49 @@ Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `in
 |---|---|---|---|
 | `DATABASE_URL` | none | **yes** | Postgres URL, e.g. `postgres://order:order@order-db:5432/orders?sslmode=disable`. The process logs an error and exits 1 if it is unset. A 5 s connect timeout is added unless the URL sets one |
 | `PORT` | `8085` | no | gRPC listen port. The `healthcheck` subcommand reads it too |
-| `METRICS_PORT` | `9090` | no | HTTP port for `/metrics` (and pprof when profiling is on) |
 | `ORDER_PROCESSING_AFTER` | `1m` | no | Offset after confirmation at which `PLACED` becomes `PROCESSING` (Go duration, e.g. `90s`) |
 | `ORDER_SHIPPED_AFTER` | `3m` | no | Offset at which it becomes `SHIPPED` |
 | `ORDER_DELIVERED_AFTER` | `6m` | no | Offset at which it becomes `DELIVERED`. Must satisfy `0 < processing < shipped < delivered`, otherwise the process exits at start-up |
 | `KAFKA_BROKERS` | empty (consumer off) | no | Comma-separated bootstrap servers, e.g. `kafka:9092`. Empty: no consumer, no Kafka metrics registered |
 | `KAFKA_CONSUMER_GROUP` | `order-service` | no | Consumer group of the `orders.placed` consumer. The topic name is a constant (no variable) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | no | OTLP/**gRPC** endpoint URL with scheme for traces, metrics and logs |
-| `OTEL_SDK_DISABLED` | unset | no | `true` forces telemetry off even with an endpoint |
-| `OTEL_SERVICE_NAME` | `order-service` | no | `service.name` resource attribute |
-| `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | no | Metric push interval: a number of milliseconds, or a Go duration (`15s`). Invalid values fall back to 15 s |
-| `PYROSCOPE_ADDR` | unset (profiling off) | no | Pyroscope server URL. Profiling (push and pprof endpoints) is on only if this is set |
-| `ENABLE_PROFILING` | unset | no | `0` forces profiling off even with `PYROSCOPE_ADDR` |
-| `ENABLE_TRACING` | unset | no | Legacy: `0` forces telemetry off |
-| `COLLECTOR_SERVICE_ADDR` | unset | no | **Legacy, to be removed** (owner decision 2026-11-13): `host:port` of a collector; turns telemetry on without `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `HOSTNAME` | OS hostname | no | Used as `service.instance.id` (the pod name in Kubernetes) |
-| `OTEL_RESOURCE_ATTRIBUTES` | unset | no | Read by the OTel SDK resource detector (`resource.WithFromEnv`), not by this code directly |
+| `METRICS_PORT` | `9090` | no | Port of the Prometheus `/metrics` endpoint (scraped by Alloy). A value that is not a port falls back to `9090` with a warning |
+| `PPROF_ADDR` | unset (no pprof) | no | `host:port` of a separate pprof listener, e.g. `127.0.0.1:6060`. Off unless set; never expose it. pprof is never served on the metrics port |
+| `LOG_LEVEL` | `info` | no | `debug`, `info`, `warn` or `error`; anything else falls back to `info` with a warning |
+| `SERVICE_VERSION` | build info, else `dev` | no | `service.version`, the `version` log field and the `build_info` label. Fallbacks in order: ldflags `-X <module>/internal/obs.Version=...` (and `.Commit=`, `.BuildTime=`), the VCS revision Go embeds in the binary (12 characters, `-dirty` if modified), `dev` |
+| `DEPLOYMENT_ENVIRONMENT` | `local` | no | `deployment.environment` on every signal and the Pyroscope tag `environment` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | no | OTLP/**gRPC** endpoint for **traces, metrics and logs**, e.g. `http://alloy:4317`. Telemetry is on only if this is a valid absolute http(s) URL; empty or malformed means off (one warning, never a crash). The legacy `COLLECTOR_SERVICE_ADDR` and `ENABLE_TRACING` are no longer read |
+| `OTEL_SDK_DISABLED` | unset | no | `true` (trimmed, case-insensitive) forces everything off: OTLP export and profiling, even if an endpoint or `PYROSCOPE_ADDR` is set |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | no | Documented knob; only gRPC is implemented, the value is not read |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | SDK default (`parentbased_always_on`) | no | Standard OpenTelemetry sampler variables, read by the SDK (tested for `always_on` and `always_off`) |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | no | Extra resource attributes (`k=v,...`); applied after the defaults, so they can override them |
+| `OTEL_SERVICE_NAME` | `order-service` | no | `service.name`; keep the default, dashboards depend on it |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | no | Milliseconds between metric pushes (also accepts durations such as `15s`) |
+| `PYROSCOPE_ADDR` | unset (profiling off) | no | Pyroscope URL (SDK push protocol, not OTLP). The only switch: no default address, `ENABLE_PROFILING=1` alone starts nothing |
+| `ENABLE_PROFILING` | unset | no | `0` forces profiling off even with `PYROSCOPE_ADDR`; any other value changes nothing |
 
-The OTLP exporters of the OpenTelemetry Go SDK also read their own standard `OTEL_EXPORTER_OTLP_*` variables (headers, TLS, timeout); they are not read by this service's code and were not tested. `OTEL_TRACES_SAMPLER` is **not** honoured: the sampler is fixed to always-on (`otlp.go`). `LOG_LEVEL` does not exist: the log level is logrus' default (info).
+The OTLP exporters of the OpenTelemetry Go SDK also read their own standard `OTEL_EXPORTER_OTLP_*` variables (headers, TLS, timeout); they are not read by this service's code and were not tested. The whole contract is in `internal/obs` (`env_test.go` is the table-driven test of the variables above).
 
 Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background loop runs the goose migrations (under goose's Postgres advisory lock, so replicas starting together apply each migration once), retrying every 2 s until the database is reachable. There is no seed data.
 
 ## Observability
 
-What the service emits today (code read 2026-11-13; the compose observability profile was not run for this README):
-
-| Signal | Today | Not there yet (standards section 6) |
+| Signal | Implementation | Destination |
 |---|---|---|
-| Traces | OTLP/gRPC, only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. A server span per inbound gRPC call (`otelgrpc`), W3C `traceparent` + `baggage` propagation, sampler always-on | spans for Postgres calls and for the Kafka consumer, trace context from Kafka headers |
-| Metrics | Prometheus on `:9090/metrics`: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics, `order_service_kafka_*` (below). The same registry is pushed over OTLP when the endpoint is set | `build_info`, DB pool stats, business counters |
-| Logs | JSON on stdout, one object per line: `timestamp` (RFC3339Nano), `severity`, `message` plus fields (`order_id`, `topic`, `partition`, `offset` for the consumer). Mirrored over OTLP when the endpoint is set. Card data does not exist here; the Kafka payload (email, address) is never logged | `trace_id` / `span_id` on the stdout line, `service`, `version`, `LOG_LEVEL` |
-| Profiles | Pyroscope push (CPU, alloc objects/space, inuse objects/space) and pprof on the metrics port, only with `PYROSCOPE_ADDR` | goroutine / mutex / block profiles, tags `version`, `environment` |
+| **Traces** | OpenTelemetry (`otelgrpc` handlers), OTLP/gRPC exporter (batch processor, queue bounded at 2048), W3C TraceContext + Baggage propagated to every downstream call. **Kafka consumer span:** each `orders.placed` record is handled inside a CONSUMER span `orders.placed process` (`messaging.system=kafka`, `messaging.destination.name`, `messaging.operation=process`, `messaging.kafka.consumer.group=order-service`, partition, offset) that is a child of the producer span named by the record's `traceparent` header; a record with missing or malformed headers starts a new root trace and is handled normally (unit-tested; the end-to-end trace through Kafka is not run here). Sampler from `OTEL_TRACES_SAMPLER` (SDK default `parentbased_always_on`) | Alloy `:4317` -> Tempo |
+| **Metrics** | Prometheus default registry: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics, `order_service_kafka_*` (below). Served as Prometheus text on `:9090/metrics` (`METRICS_PORT`) and, because the same registry is bridged into OpenTelemetry, also pushed over OTLP every 15 s (metric names identical). Plus `build_info{service,version,commit} 1` | Alloy scrapes `:9090` -> Mimir |
+| **Logs** | `logrus`, one JSON object per line on stdout, plus an OTLP/gRPC hook (`otellogrus`); handlers (`internal/orders`) and the Kafka consumer log with `log.WithContext(ctx)`, so those lines carry `trace_id`/`span_id` while a span is recording (the span only exists when telemetry is on: without an OTLP endpoint the SDK is not installed and no ids are written). Card data does not exist here; the order e-mail, address and session id are never logged | stdout -> Alloy -> Loki; OTLP -> Alloy -> Loki |
+| **Profiles** | Pyroscope Go SDK (CPU, alloc/in-use objects and space, goroutines, mutex, block), only with `PYROSCOPE_ADDR`; tags `service_name`, `version`, `environment` | Pyroscope |
 
-Resource attributes today: `service.name`, `service.instance.id` and the SDK's telemetry attributes (plus whatever `OTEL_RESOURCE_ATTRIBUTES` adds). `service.version`, `service.namespace` and `deployment.environment` are not set.
+**Telemetry contract** (the code is `internal/obs`, the same package in every Go service): telemetry is on only if `OTEL_EXPORTER_OTLP_ENDPOINT` is a valid absolute http(s) URL; `OTEL_SDK_DISABLED=true` forces everything off (profiling too); profiling only with `PYROSCOPE_ADDR`. Start never waits for the collector (the exporters connect in the background) and on SIGTERM the flush is cut off after 4 s, so a blackholed collector cannot hold the process (unit-tested with a listener that never answers: start and shutdown both return within the bound).
+
+**Resource attributes** on every signal: `service.name` (`OTEL_SERVICE_NAME`, default `order-service`), `service.version` (`SERVICE_VERSION`, else build info, else `dev`), `service.namespace=everly`, `deployment.environment` (`DEPLOYMENT_ENVIRONMENT`, default `local`), `service.instance.id` (hostname). `OTEL_RESOURCE_ATTRIBUTES` is applied last.
+
+**Log shape** (one shape for all services): `timestamp` (RFC 3339, UTC, milliseconds), `severity` (`debug`, `info`, `warning`, `error`), `message`, `service`, `version`, `trace_id` and `span_id` (hex, only while a valid span is active, never empty or all zeros), `request_id` (when the caller sent one), `error` (string, on errors), plus the call's own fields (for example `order_id`). Level from `LOG_LEVEL`. `trace_id`/`span_id` come from the context of the log call: handlers and clients log with `log.WithContext(ctx)`, the formatter reads the span from it. Calls without a context (startup, background work) have no ids. No card data, tokens or e-mail addresses are logged.
+
+**Startup and version**: the first line is `message: "starting"` with `version`, `commit` and `environment`; `version`/`commit` come from `SERVICE_VERSION`, ldflags `-X <module>/internal/obs.Version=` / `.Commit=`, or the VCS data Go embeds (no Dockerfile change was made: without any of them a container image reports `version: "dev"`, `commit: "unknown"`). Panics are logged as one JSON line (`message: "panic"`, `error`) before the process dies; a startup error is one JSON error line, exit 1.
+
+**pprof** is off. `PPROF_ADDR=127.0.0.1:6060` starts a separate listener; it is never on the metrics port.
 
 Kafka consumer metrics:
 
@@ -130,7 +140,7 @@ Migrations: [goose](https://github.com/pressly/goose) SQL files in `internal/ord
 
 ## Develop
 
-Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker for integration tests, [`grpcurl`](https://github.com/fullstorydev/grpcurl) for manual calls. Layout: `cmd/server/` (entry point, telemetry, health, Kafka start), `internal/orders/` (service, validation, store, migrations), `internal/events/` (Kafka consumer), `proto/`, `tests/integration/`.
+Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker for integration tests, [`grpcurl`](https://github.com/fullstorydev/grpcurl) for manual calls. Layout: `cmd/server/` (entry point, health, Kafka start), `internal/obs/` (telemetry, logs, build_info, metrics server), `internal/orders/` (service, validation, store, migrations), `internal/events/` (Kafka consumer), `proto/`, `tests/integration/`.
 
 | Step | Command | Result on 2026-11-13 |
 |---|---|---|
@@ -160,7 +170,7 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 ## Operate
 
 - **Health:** `grpc.health.v1` on the service port, empty service name and `hipstershop.orders.OrderService`. `NOT_SERVING` until the migrations are done, and again whenever the Postgres ping fails (checked every 5 s); handlers answer `UNAVAILABLE` meanwhile. Kafka is never part of the health. The image `HEALTHCHECK` runs `/app/order-service healthcheck` (exit 0 only on `SERVING`).
-- **Shutdown:** on SIGTERM/SIGINT health goes `NOT_SERVING`, `GracefulStop` with a 10 s cap (then `Stop`), the metrics server stops (5 s), the Kafka consumer finishes and commits its current record (at most 8 s), telemetry is flushed (5 s), the pool is closed, exit 0.
+- **Shutdown:** on SIGTERM/SIGINT health goes `NOT_SERVING`, `GracefulStop` with a 10 s cap (then `Stop`), the Kafka consumer finishes and commits its current record (at most 8 s), the pool is closed, then telemetry and profiles are flushed and the metrics server stops (together capped at 4 s, so a blackholed collector cannot hold the process), exit 0.
 - **Scaling:** stateless except for Postgres, so several replicas are possible: migrations are serialised by the advisory lock, Kafka consumers share the group `order-service`. Computed status uses the clock of the replica that answers (see limits). Multi-replica operation was not run.
 - **Image:** Alpine runtime, user `10001:10001`, `EXPOSE 8085 9090`, about 12 MB when last built.
 - Runbook entries and failure behaviour: [`docs/operations.md`](docs/operations.md).
@@ -171,9 +181,9 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 - The computed status uses the clock of the replica that serves the call; replicas with skewed clocks can show a stage a moment early or late.
 - `zip_code` is an `int32` to stay compatible with `hipstershop.Address`: postal codes with letters or leading zeros do not fit.
 - Offset paging (page limit 1,000,000); `ListOrders` reads the total and the page in separate statements.
-- No spans for database calls; no `trace_id` in logs; no version/commit exposed (see Observability).
+- No spans for database calls (see Observability).
 - Kafka: PLAINTEXT without authentication only; a permanently failing record is retried forever by design (later records wait behind it).
-- Not run: the image with the Kafka consumer built into it, arm64 build, more than one replica, a multi-broker cluster. The legacy `COLLECTOR_SERVICE_ADDR` is still read (to be removed).
+- Not run: the image with the Kafka consumer built into it, arm64 build, more than one replica, a multi-broker cluster. Observability step 3 (`internal/obs` wiring) is unit-tested only: not run in the compose stack, not run with a live collector, Pyroscope or Kafka.
 
 ## License
 
