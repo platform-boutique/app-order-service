@@ -12,9 +12,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# declared late on purpose: a new value must not invalidate the dependency layers above (empty = build time not set)
+ARG BUILD_TIME
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
     -trimpath \
-    -ldflags="-s -w -X order-service/internal/obs.Version=${SERVICE_VERSION} -X order-service/internal/obs.Commit=${SERVICE_COMMIT}" \
+    -ldflags="-s -w -X order-service/internal/obs.Version=${SERVICE_VERSION} -X order-service/internal/obs.Commit=${SERVICE_COMMIT} -X order-service/internal/obs.BuildTime=${BUILD_TIME}" \
     -o /order-service \
     ./cmd/server
 
