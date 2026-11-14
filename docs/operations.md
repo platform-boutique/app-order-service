@@ -16,12 +16,11 @@ grpcurl -plaintext localhost:8085 grpc.health.v1.Health/Check
 SIGTERM or SIGINT:
 
 1. health goes `NOT_SERVING` so probes fail first;
-2. `GracefulStop` with a 10 s cap, then `Stop`;
-3. the Kafka consumer finishes and commits the record it is handling, handles no further record, leaves the group (at most 8 s);
-4. the pool is closed;
-5. telemetry and profiles are flushed and the metrics server is shut down, together capped at 4 s (`obs.DefaultShutdownTimeout`), exit 0.
+2. `GracefulStop` and the Kafka consumer (finish and commit the record it is handling, handle no further record, leave the group) run in parallel and get 5 s together; what is still running after that is cut off (`Stop`; the consumer's last record is then redelivered and recognised as a duplicate);
+3. the pool is closed, waiting at most 1 s for connections that are still checked out;
+4. telemetry and profiles are flushed and the metrics server is shut down, capped at 3 s, exit 0.
 
-Measured earlier by the author: `docker stop` exit code 0 (image smoke run), plain-binary SIGTERM about 0.1 s with the consumer. Not re-measured with a blackholed OTLP endpoint.
+The budgets add up to 9 s inside the 10 s of CODE-04 (`cmd/server/shutdown.go`); a watchdog started at the signal ends the process with exit 1 after 10 s if anything else hangs. Unit-tested with a fake clock (a gRPC call, a consumer and a pool that never finish are each abandoned at their budget, the watchdog fires at 10 s). Earlier, by the author: `docker stop` exit code 0 (image smoke run), plain-binary SIGTERM about 0.1 s with the consumer. Not re-measured with a blackholed OTLP endpoint or a stuck consumer.
 
 ## Scaling and replicas
 
@@ -37,6 +36,8 @@ Measured earlier by the author: `docker stop` exit code 0 (image smoke run), pla
 | Postgres down at start | server listens, health `NOT_SERVING`, migration retried every 2 s |
 | Postgres goes away while running | health `NOT_SERVING` within about 5 s, handlers answer `UNAVAILABLE`, `SERVING` again after it returns |
 | Kafka down | consumer logs a warning every few seconds; gRPC and health unaffected |
+| Topic missing | the consumer creates `[KAFKA_TOPIC_PREFIX]orders.placed` with the broker's default partitions and replication on its first poll (after the database is ready); if the broker refuses (ACL) it logs a warning and assumes the topic exists |
+| Database slow or hanging | every call is cut off after `REQUEST_TIMEOUT` (5 s) and answered `DEADLINE_EXCEEDED` |
 | Poison record with a permanent database error | retried forever by design; later records wait; the warn log shows the attempt count |
 | Handler panic | turned into `INTERNAL` by a recovery interceptor; the process keeps running |
 | Collector unreachable | telemetry export fails in the background; start-up does not depend on it |
