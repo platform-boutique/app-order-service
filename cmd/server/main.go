@@ -47,7 +47,7 @@ func main() {
 
 	// Env contract (OTEL_*, PYROSCOPE_ADDR), JSON logs, OTLP pipelines, Pyroscope, build_info, /metrics on
 	// :9090 (METRICS_PORT) and pprof only with PPROF_ADDR all live in internal/obs.
-	o := obs.Start(context.Background(), obs.Options{Service: serviceName, Loggers: []*logrus.Logger{log}})
+	o := obs.Start(context.Background(), obs.Options{Service: serviceName, Loggers: []*logrus.Logger{log}, ShutdownTimeout: obsFlushBudget})
 	defer o.Recover()
 	defer o.Shutdown()
 
@@ -81,6 +81,7 @@ func run(port, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("database pool: %w", err)
 	}
+	// closed by the shutdown steps, after the consumer and the gRPC calls are done; this defer covers early returns
 	defer pool.Close()
 	if err := obs.RegisterPoolMetrics(prometheus.DefaultRegisterer, pool); err != nil {
 		log.WithError(err).Warn("database pool metrics not registered")
@@ -125,7 +126,7 @@ func run(port, dsn string) error {
 	if err != nil {
 		return err
 	}
-	defer stopKafka(8 * time.Second)
+	defer stopKafka(drainBudget)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -140,15 +141,16 @@ func run(port, dsn string) error {
 	}
 
 	log.Info("shutdown signal received, draining")
+	watchdog(time.After, os.Exit, log)
 	healthSrv.Shutdown() // NOT_SERVING for every service, so probes fail first
-	done := make(chan struct{})
-	go func() { srv.GracefulStop(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		log.Warn("graceful stop timed out, closing remaining connections")
-		srv.Stop()
-	}
+	(&shutdownSteps{
+		GracefulStop: srv.GracefulStop,
+		ForceStop:    srv.Stop,
+		StopConsumer: stopKafka,
+		ClosePool:    pool.Close,
+		After:        time.After,
+		Log:          log,
+	}).run()
 	return nil
 }
 
