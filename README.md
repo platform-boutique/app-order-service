@@ -8,7 +8,7 @@ Context diagram and the main flow as sequence diagram: [`docs/architecture.md`](
 
 | | |
 |---|---|
-| Language / runtime | Go 1.26 (`go.mod`: `go 1.26.0`, `toolchain go1.26.10`), static binary, `CGO_ENABLED=0` |
+| Language / runtime | Go 1.26 (`go.mod`: `go 1.26.0`, `toolchain go1.26.11`), static binary, `CGO_ENABLED=0` |
 | Image | built locally only: `platform-demo/order-service:local` (`Dockerfile`, user `10001:10001`) |
 | Ports | gRPC `8085` (plaintext), HTTP `9090` (`/metrics`; pprof only on a separate `PPROF_ADDR`) |
 | Health | `grpc.health.v1.Health/Check` on `8085`, `NOT_SERVING` until the migrations are done and whenever the database does not answer a ping (every 5 s) |
