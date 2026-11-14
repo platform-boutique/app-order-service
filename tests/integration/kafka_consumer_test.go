@@ -325,27 +325,51 @@ func TestKafkaPendingBecomesPlaced(t *testing.T) {
 	rc.stop(t)
 }
 
-// The consumer starts while its topic does not exist (nobody has published yet); the topic is created explicitly
-// at a late moment and the consumer must pick it up by itself.
-func TestKafkaTopicCreatedAfterTheConsumerStarted(t *testing.T) {
+// The consumer starts while its topic does not exist (nobody has published yet): it creates the topic itself
+// (CODE-09) and then handles the first event. The topic name carries KAFKA_TOPIC_PREFIX (FUT-03). The broker
+// decides partitions and replication (the test broker: KAFKA_NUM_PARTITIONS=3).
+func TestKafkaConsumerCreatesAMissingTopicWithPrefix(t *testing.T) {
 	brokers := kafkaBrokers(t)
 	svc, _, _ := setup(t)
-	topic, group := uniq("orders.placed.it"), uniq("g")
+	prefix := uniq("it") + "."
+	cfg := events.ConfigFromEnv(func(k string) string {
+		return map[string]string{"KAFKA_BROKERS": brokers, "KAFKA_TOPIC_PREFIX": prefix}[k]
+	})
+	if cfg.Topic != prefix+"orders.placed" {
+		t.Fatalf("topic = %q", cfg.Topic)
+	}
 	id := uniq("ord")
 	createPending(t, svc, id)
 
-	rc := startConsumer(t, brokers, topic, group, svc)
-	time.Sleep(3 * time.Second) // the consumer is up and looking for a topic that is not there
+	rc := startConsumer(t, brokers, cfg.Topic, uniq("g"), svc) // the topic is NOT created by the test
+	cl, err := kgo.NewClient(kgo.SeedBrokers(strings.Split(brokers, ",")...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	until(t, "the consumer to create the topic", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return topicHasLeaders(ctx, cl, cfg.Topic, 3) == nil
+	})
 	if getOrder(t, svc, id).Status != pb.OrderStatus_ORDER_STATUS_PENDING {
-		t.Fatal("order changed without a topic")
+		t.Fatal("order changed without an event")
 	}
-	createTopic(t, brokers, topic)
-	produceEvent(t, brokers, topic, id, "TRK-1", "TXN-1")
+	produceEvent(t, brokers, cfg.Topic, id, "TRK-1", "TXN-1")
+	until(t, "order PLACED from the topic the consumer created", isPlaced(t, svc, id))
+	rc.stop(t)
+}
 
-	until(t, "order PLACED after the topic appeared", isPlaced(t, svc, id))
-	if got := rc.h.calls(); len(got) != 1 || got[0] != id {
-		t.Errorf("handled %v", got)
-	}
+// A second start finds the topic and leaves it alone (TOPIC_ALREADY_EXISTS is success).
+func TestKafkaConsumerLeavesAnExistingTopicAlone(t *testing.T) {
+	brokers := kafkaBrokers(t)
+	svc, _, _ := setup(t)
+	topic := newTopic(t, brokers) // 3 partitions, created by the test
+	id := uniq("ord")
+	createPending(t, svc, id)
+	rc := startConsumer(t, brokers, topic, uniq("g"), svc)
+	produceEvent(t, brokers, topic, id, "TRK-1", "TXN-1")
+	until(t, "order PLACED", isPlaced(t, svc, id))
 	rc.stop(t)
 }
 

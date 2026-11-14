@@ -121,7 +121,11 @@ func run(port, dsn string) error {
 	go watchDatabase(ctx, pool, store, svc, healthSrv)
 
 	// --- Kafka: orders.placed consumer (self-healing confirm), only with KAFKA_BROKERS set; stopped before the pool closes ---
-	defer startKafka(ctx, svc)()
+	stopKafka, err := startKafka(ctx, svc)
+	if err != nil {
+		return err
+	}
+	defer stopKafka(8 * time.Second)
 
 	serveErr := make(chan error, 1)
 	go func() {
