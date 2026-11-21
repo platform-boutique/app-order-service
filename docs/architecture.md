@@ -15,7 +15,7 @@ flowchart LR
     prom[Prometheus scrape :9090] -.-> order
 ```
 
-order-service never calls another service. The callers are taken from the workspace `local/compose.yaml` and the other services' READMEs; they were not re-verified in their code for this page.
+order-service never calls another service. The callers are checkout-service (`CreateOrder`, `ConfirmOrder`, `FailOrder` and, for idempotency, `GetOrder`) and the frontend (`ListOrders`, `GetOrder`, `ClaimOrders`); checked against the `origin/main` code of the callers on 2026-11-21. The diagram below shows the main ones.
 
 ## Main flow: placing an order
 
