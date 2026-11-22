@@ -17,6 +17,8 @@
 
 **pprof** is off. `PPROF_ADDR=127.0.0.1:6060` starts a separate listener; it is never on the metrics port.
 
+Order metrics (OBS-20, orders created and confirmed): `order_service_orders_total{event}` counts what the database committed: `created` (a new PENDING order), `placed` (PENDING to PLACED, by the ConfirmOrder RPC or by the `orders.placed` reconciliation) and `failed` (PENDING to FAILED). An idempotent replay, a refused transition and a rolled-back transaction are never counted; the series start at 0. In the compose stack on 2026-11-22: created 21 = placed 12 + failed 9.
+
 Kafka consumer metrics:
 
 | Metric | Meaning |
@@ -36,4 +38,4 @@ Telemetry is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is a valid absolute http(s
 
 ## Verification status
 
-Unit-tested (`go test ./cmd/... ./internal/...`): the environment matrix, the log shape, resource attributes, the blackholed-collector start/shutdown bound, `build_info`, the Kafka header round trip and the consumer span, ids on the handler log lines. Not run: the compose stack, a live collector, Pyroscope or Kafka, the integration tests, an image build.
+Unit-tested (`go test ./cmd/... ./internal/...`): the environment matrix, the log shape, resource attributes, the blackholed-collector start/shutdown bound, `build_info`, the Kafka header round trip and the consumer span, ids on the handler log lines. Run on 2026-11-22: the integration tests (Postgres and Kafka, 23 passed), an image build and the compose stack (smoke 87/87 three times, consumer lag 0, no error logs). Not run: a live collector and Pyroscope.

@@ -105,7 +105,7 @@ Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background l
 | Signal | Implementation | Destination |
 |---|---|---|
 | **Traces** | OpenTelemetry (`otelgrpc` handlers), OTLP/gRPC exporter (batch processor, queue bounded at 2048), W3C TraceContext + Baggage propagated to every downstream call. **Kafka consumer span:** each `orders.placed` record is handled inside a CONSUMER span `orders.placed process` (`messaging.system=kafka`, `messaging.destination.name`, `messaging.operation=process`, `messaging.kafka.consumer.group=order-service`, partition, offset) that is a child of the producer span named by the record's `traceparent` header; a record with missing or malformed headers starts a new root trace and is handled normally (unit-tested; the end-to-end trace through Kafka is not run here). Sampler from `OTEL_TRACES_SAMPLER` (SDK default `parentbased_always_on`) | Alloy `:4317` -> Tempo |
-| **Metrics** | Prometheus default registry: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics, `order_service_kafka_*` (below). Served as Prometheus text on `:9090/metrics` (`METRICS_PORT`) and, because the same registry is bridged into OpenTelemetry, also pushed over OTLP every 15 s (metric names identical). Plus `build_info{service,version,commit} 1` | Alloy scrapes `:9090` -> Mimir |
+| **Metrics** | Prometheus default registry: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics, `order_service_kafka_*` (below). Served as Prometheus text on `:9090/metrics` (`METRICS_PORT`) and, because the same registry is bridged into OpenTelemetry, also pushed over OTLP every 15 s (metric names identical). Plus `build_info{service,version,commit} 1`, `order_service_orders_total{event}` (committed state changes: `created`, `placed`, `failed`; replays are not counted) | Alloy scrapes `:9090` -> Mimir |
 | **Logs** | `logrus`, one JSON object per line on stdout, plus an OTLP/gRPC hook (`otellogrus`); handlers (`internal/orders`) and the Kafka consumer log with `log.WithContext(ctx)`, so those lines carry `trace_id`/`span_id` while a span is recording (the span only exists when telemetry is on: without an OTLP endpoint the SDK is not installed and no ids are written). Card data does not exist here; the order e-mail, address and session id are never logged | stdout -> Alloy -> Loki; OTLP -> Alloy -> Loki |
 | **Profiles** | Pyroscope Go SDK (CPU, alloc/in-use objects and space, goroutines, mutex, block), only with `PYROSCOPE_ADDR`; tags `service_name`, `version`, `environment` | Pyroscope |
 
@@ -147,15 +147,15 @@ Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker for integration te
 | Step | Command | Result on 2026-11-13 (rows marked 2026-11-21 were run again on `origin/main`) |
 |---|---|---|
 | Vet + unit tests | `go vet ./... && go test -race -count=1 ./...` | run, passed; run again 2026-11-21: passed |
-| Format | `gofmt -l .` | run, no files listed; run again 2026-11-21: none |
-| Lint | `golangci-lint run ./...` (config `.golangci.yaml`, v2 default linters) | run with golangci-lint v2.11.4, 0 issues; also with `--build-tags integration`, 0 issues. CI pins v2.14.0: not run |
-| Integration (Postgres) | see below | run on 2026-11-21 against a throwaway `postgres:17-alpine`: passed (the Kafka tests skip without `TEST_KAFKA_BROKERS`, so they were not run) (earlier runs by the author are recorded in `docs/development.md`) |
-| Integration (Kafka) | see below | not run today |
-| Vulnerability / security scan | `govulncheck ./...`, `gosec -exclude-generated ./...` | not run today |
-| Image | `docker build -t platform-demo/order-service:local .` | not run today |
+| Format | `gofmt -l .` | run, no files listed; run again 2026-11-22: none |
+| Lint | `golangci-lint run ./...` (config `.golangci.yaml`, v2 default linters) | run 2026-11-22 with golangci-lint v2.14.0 (the version CI pins), 0 issues; also with `--build-tags integration`, 0 issues |
+| Integration (Postgres) | see below | run on 2026-11-22 with `-race` against a throwaway `postgres:17-alpine` together with the Kafka tests below: 23 tests passed, none skipped (earlier runs by the author are recorded in `docs/development.md`) |
+| Integration (Kafka) | see below | run on 2026-11-22 against a throwaway single-node `apache/kafka:4.3.2` with `TEST_KAFKA_CONTAINER` set: all Kafka tests passed, including the broker restart and the broker unavailable at start |
+| Vulnerability / security scan | `govulncheck ./...`, `gosec -exclude-generated ./...` | run 2026-11-22: govulncheck `No vulnerabilities found`; gosec 0 issues (29 files) |
+| Image | `docker build -t platform-demo/order-service:local .` | run 2026-11-22 (linux/amd64, 51 MB, runs as 10001:10001, exec-form healthcheck) |
 | Docs | `mkdocs build --strict` (mkdocs 1.6.1 + mkdocs-techdocs-core 1.7.1, Python 3.12 venv made with uv) and the link check `python3 -I tools/check-md-links.py .` from `platform-demo-workflows` (relative links in `README.md` and `docs/`) | run, passed; run again 2026-11-21, both passed |
-| Image scan | `trivy image --severity CRITICAL,HIGH --exit-code 1 platform-demo/order-service:local` | not run today |
-| Secret scan | `pre-commit run --all-files` (`.pre-commit-config.yaml`, gitleaks) or `gitleaks git --redact` | run 2026-11-21 with the gitleaks binary of the pre-commit cache (`gitleaks git --redact`, full history, 38 commits): no leaks found |
+| Image scan | `trivy image --severity CRITICAL,HIGH --exit-code 1 platform-demo/order-service:local` | run 2026-11-22: CRITICAL and HIGH 0 |
+| Secret scan | `pre-commit run --all-files` (`.pre-commit-config.yaml`, gitleaks) or `gitleaks git --redact` | run 2026-11-22 with the gitleaks binary of the pre-commit cache (`gitleaks git --redact`, full history): no leaks found |
 | Workflow lint | `actionlint` | run 2026-11-21 (actionlint 1.7.12), no findings |
 
 Integration tests (build tag `integration`, each test creates and drops its own database; Kafka tests skip without `TEST_KAFKA_BROKERS`):
@@ -186,9 +186,8 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 - The computed status uses the clock of the replica that serves the call; replicas with skewed clocks can show a stage a moment early or late.
 - `zip_code` is an `int32` to stay compatible with `hipstershop.Address`: postal codes with letters or leading zeros do not fit.
 - Offset paging (page limit 1,000,000); `ListOrders` reads the total and the page in separate statements.
-- No spans for database calls (see Observability).
 - Kafka: PLAINTEXT without authentication only; a permanently failing record is retried forever by design (later records wait behind it).
-- Not run: the image with the Kafka consumer built into it, arm64 build, more than one replica, a multi-broker cluster. Observability step 3 (`internal/obs` wiring) is unit-tested only: not run in the compose stack, not run with a live collector, Pyroscope or Kafka.
+- Not run: arm64 build (amd64 only by decision), more than one replica, a multi-broker cluster, a live collector and Pyroscope. The image with the Kafka consumer was run in the compose stack on 2026-11-22 (smoke 87/87 three times; checkout events confirmed orders through Kafka, consumer lag 0).
 
 ## License
 

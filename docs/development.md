@@ -7,7 +7,7 @@ Commands run on 2026-11-13 for the standards change (host: Go 1.22 with `GOTOOLC
 | Command | Result |
 |---|---|
 | `go vet ./... && go test -race -count=1 ./...` | passed (3 packages with tests) |
-| `golangci-lint run ./...` and `golangci-lint run --build-tags integration ./...` (golangci-lint v2.11.4, `.golangci.yaml`) | 0 issues. The shared pipeline pins v2.14.0: not run |
+| `golangci-lint run ./...` and `golangci-lint run --build-tags integration ./...` (golangci-lint v2.14.0 as pinned by the shared pipeline, `.golangci.yaml`) | 0 issues, run 2026-11-22 |
 | `gofmt -l .` | no files listed |
 | `mkdocs build --strict` (mkdocs 1.6.1, mkdocs-techdocs-core 1.7.1, Python 3.12 venv made with uv) | passed |
 
@@ -63,7 +63,7 @@ Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto 
 What was run and what was not:
 
 - Run (commands above): unit tests for event parsing (valid, unknown fields, schema version 0/2/missing/string, malformed, truncated), `ConfirmFromEvent` against the in-memory store (all cases in the table), the handler's outcome mapping and log content, and the consumer loop with a fake record source and fake sleep (batch commit, skips, retry then success in order without skipping, shutdown during a retry, record in flight at shutdown, poll and commit failures). Integration tests (build tag `integration`) against a throwaway single-node `apache/kafka:4.3.2` and `postgres:17-alpine`: `PENDING -> PLACED`, the topic created explicitly after the consumer started (every other test creates its topic with 3 partitions and waits for the leaders before producing; the test producer retries unknown topics without limit), with a one-time wait at the start until the fresh broker can serve consumer groups (its first group request creates and loads `__consumer_offsets`, which took 10 to 60 s on a loaded host and made the first test slow), duplicate / conflicting / FAILED / unknown / malformed / schema-2 records in one partition, restart of the consumer resuming after the committed offset, a transient failure retried and not skipped, the broker unreachable at start and then reachable (through a late-started TCP forwarder), and a `docker restart` of the broker while the consumer runs.
-- Not run: the container image with the consumer, the compose stack end to end with checkout publishing, more than one consumer instance in the same group (rebalancing between two replicas), a multi-broker cluster, TLS/SASL, a poison record that fails with a permanent database error (it would be retried forever by design; the warn log shows the attempt count).
+- Run on 2026-11-22: the container image with the consumer and the compose stack end to end with checkout publishing (smoke 87/87 three times). Not run: more than one consumer instance in the same group (rebalancing between two replicas), a multi-broker cluster, TLS/SASL, a poison record that fails with a permanent database error (it would be retried forever by design; the warn log shows the attempt count).
 
 ## Build the docs
 
