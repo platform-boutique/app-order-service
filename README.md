@@ -20,7 +20,7 @@ Context diagram and the main flow as sequence diagram: [`docs/architecture.md`](
 
 ## Status
 
-No CI pipeline, GitHub repository, Helm chart or Backstage registration exists yet; the service is built and run locally only. Status badges are added when the repo has a pipeline.
+The repository has the shared CI pipeline (`ci / gate`, platform-demo-workflows v3.8.0) and merges to `main` publish nothing (`start-publish: false`, no `publish.yaml`). No Helm chart exists and the service is not deployed in any environment yet; it runs in the local shop only, built from this repository by `local/compose.yaml`.
 
 ## Quick start
 
