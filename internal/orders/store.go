@@ -182,6 +182,7 @@ func (s *PGStore) Create(ctx context.Context, n NewOrder, now time.Time) (Order,
 	if err := tx.Commit(ctx); err != nil {
 		return Order{}, false, classify(err)
 	}
+	ordersTotal.WithLabelValues(eventCreated).Inc()
 	return o, true, nil
 }
 
@@ -225,6 +226,7 @@ func (s *PGStore) transition(ctx context.Context, id string, apply func(Order) (
 	if err := tx.Commit(ctx); err != nil {
 		return Order{}, classify(err)
 	}
+	countTransition(updated.State)
 	return updated, nil
 }
 
