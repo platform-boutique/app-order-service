@@ -13,6 +13,6 @@ A gRPC service that stores the orders of the Everly shop and reports their track
 | Ports | gRPC `8085`, HTTP `9090` (`/metrics`; pprof only on `PPROF_ADDR`) |
 | State | its own Postgres (`orders`, `order_items`) |
 | Called by | checkout-service, frontend |
-| Status | not deployed anywhere yet; no pipeline, no Helm chart |
+| Status | shared CI pipeline with Publish; Helm chart in platform-demo-helm; not deployed in any environment yet |
 
 Pages: [architecture](architecture.md), [API](api.md), [configuration](configuration.md), [observability](observability.md), [operations](operations.md), [development](development.md), [decisions](adr/0001-one-postgres-per-service.md).
